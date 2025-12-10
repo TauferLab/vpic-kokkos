@@ -263,6 +263,11 @@ public:
 
   void field_dump(DumpParameters & dumpParams);
   void hydro_dump(const char * speciesname, DumpParameters & dumpParams);
+  
+  // Binary Write Interface
+  void write_fields_binary(const char* fbase, field_array_t* fa);
+  void write_hydro_binary(const char* fbase, hydro_array_t* ha, const char* species_name);
+  void write_particles_binary(const char* fbase, const char* species_name);
 
   ///////////////////
   // Useful accessors
