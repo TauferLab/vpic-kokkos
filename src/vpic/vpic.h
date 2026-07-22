@@ -265,9 +265,38 @@ public:
   void hydro_dump(const char * speciesname, DumpParameters & dumpParams);
   
   // Binary Write Interface
-  void write_fields_binary(const char* fbase, field_array_t* fa);
-  void write_hydro_binary(const char* fbase, hydro_array_t* ha, const char* species_name);
+  void write_fields_binary(DumpParameters& params, field_array_t* fa);
+  void write_hydro_binary(DumpParameters& params, hydro_array_t* ha, const char* species_name);
   void write_particles_binary(const char* fbase, const char* species_name);
+  
+  #ifdef VPIC_ENABLE_HDF5
+  /**
+   * @brief Write fields to HDF5. 
+   * Supports both one-file-per-rank (multi) and single-shared-file (single).
+   * * @param params Dump parameters (output vars, directory, etc.)
+   * @param fa The field array to dump
+   * @param single_file If true, uses PHDF5 to write to a single file. 
+   * If false, writes one file per rank.
+   */
+  void write_fields_hdf5(DumpParameters& params, field_array_t* fa, bool single_file = false);
+
+  /**
+   * @brief Write hydro data to HDF5.
+   * * @param params Dump parameters
+   * @param ha Hydro array
+   * @param species_name Name of species (for filename/grouping)
+   * @param single_file Toggle parallel I/O
+   */
+  void write_hydro_hdf5(DumpParameters& params, hydro_array_t* ha, const char* species_name, bool single_file = false);
+
+  /**
+   * @brief Write particles to HDF5.
+   * * @param fbase Base filename/directory
+   * @param species_name Species to dump
+   * @param single_file Toggle parallel I/O
+   */
+  void write_particles_hdf5(const char* fbase, const char* species_name, bool single_file = false);
+  #endif
 
   ///////////////////
   // Useful accessors
@@ -491,8 +520,11 @@ public:
 
     // Pre-size communications buffers. This is done to get most memory
     // allocation over with before the simulation starts running
+    int nx2 = grid->nx + 2;
+    int ny2 = grid->ny + 2;
+    int nz2 = grid->nz + 2;
 
-    mp_size_recv_buffer(grid->mp,BOUNDARY(-1, 0, 0),ny1*nz1*sizeof(hydro_t));
+/*     mp_size_recv_buffer(grid->mp,BOUNDARY(-1, 0, 0),ny1*nz1*sizeof(hydro_t));
     mp_size_recv_buffer(grid->mp,BOUNDARY( 1, 0, 0),ny1*nz1*sizeof(hydro_t));
     mp_size_recv_buffer(grid->mp,BOUNDARY( 0,-1, 0),nz1*nx1*sizeof(hydro_t));
     mp_size_recv_buffer(grid->mp,BOUNDARY( 0, 1, 0),nz1*nx1*sizeof(hydro_t));
@@ -504,7 +536,20 @@ public:
     mp_size_send_buffer(grid->mp,BOUNDARY( 0,-1, 0),nz1*nx1*sizeof(hydro_t));
     mp_size_send_buffer(grid->mp,BOUNDARY( 0, 1, 0),nz1*nx1*sizeof(hydro_t));
     mp_size_send_buffer(grid->mp,BOUNDARY( 0, 0,-1),nx1*ny1*sizeof(hydro_t));
-    mp_size_send_buffer(grid->mp,BOUNDARY( 0, 0, 1),nx1*ny1*sizeof(hydro_t));
+    mp_size_send_buffer(grid->mp,BOUNDARY( 0, 0, 1),nx1*ny1*sizeof(hydro_t)); */
+    mp_size_recv_buffer(grid->mp,BOUNDARY(-1, 0, 0),ny2*nz2*sizeof(hydro_t)+ 128);
+    mp_size_recv_buffer(grid->mp,BOUNDARY( 1, 0, 0),ny2*nz2*sizeof(hydro_t)+ 128);
+    mp_size_recv_buffer(grid->mp,BOUNDARY( 0,-1, 0),nz2*nx2*sizeof(hydro_t)+ 128);
+    mp_size_recv_buffer(grid->mp,BOUNDARY( 0, 1, 0),nz2*nx2*sizeof(hydro_t)+ 128);
+    mp_size_recv_buffer(grid->mp,BOUNDARY( 0, 0,-1),nx2*ny2*sizeof(hydro_t)+ 128);
+    mp_size_recv_buffer(grid->mp,BOUNDARY( 0, 0, 1),nx2*ny2*sizeof(hydro_t)+ 128);
+
+    mp_size_send_buffer(grid->mp,BOUNDARY(-1, 0, 0),ny2*nz2*sizeof(hydro_t)+ 128);
+    mp_size_send_buffer(grid->mp,BOUNDARY( 1, 0, 0),ny2*nz2*sizeof(hydro_t)+ 128);
+    mp_size_send_buffer(grid->mp,BOUNDARY( 0,-1, 0),nz2*nx2*sizeof(hydro_t)+ 128);
+    mp_size_send_buffer(grid->mp,BOUNDARY( 0, 1, 0),nz2*nx2*sizeof(hydro_t)+ 128);
+    mp_size_send_buffer(grid->mp,BOUNDARY( 0, 0,-1),nx2*ny2*sizeof(hydro_t)+ 128);
+    mp_size_send_buffer(grid->mp,BOUNDARY( 0, 0, 1),nx2*ny2*sizeof(hydro_t)+ 128);
   }
 
   // Other field helpers are provided by macros in deck_wrapper.cxx

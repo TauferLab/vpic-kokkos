@@ -72,6 +72,9 @@ option(VPIC_ENABLE_VECTORIZATION "Enable improved vectorization for CPUs" OFF)
 
 option(VPIC_ENABLE_ACCUMULATOR "Enable explicit accumulators for better performnace on CPUs" OFF)
 
+option(VPIC_ENABLE_HDF5 "Enable HDF5 output support" OFF)
+option(VPIC_ENABLE_HDF5_ASYNC "Enable HDF5 Async support (Experimental)" OFF)
+
 add_definitions(-DUSE_KOKKOS)
 set(VPIC_CPPFLAGS "${VPIC_CPPFLAGS} -DUSE_KOKKOS") # Set it here for ./deck/ files
 
@@ -238,8 +241,12 @@ set(KOKKOS_COMPILE_OPTIONS_FILE ${PROJECT_BINARY_DIR}/kokkos_compile_options)
 # For an "external" build these will be the same, but for an internal we need to gather both
 file(GENERATE OUTPUT ${KOKKOS_CORE_INCLUDES_FILE} CONTENT "${KOKKOS_INCLUDE_DIRS}")
 file(GENERATE OUTPUT ${KOKKOS_CONTAINER_INCLUDES_FILE} CONTENT "${KOKKOS_INCLUDE_CONTAINERS}")
-string(REPLACE ";" " " kokkos_compile_options "${KOKKOS_COMPILE_OPTIONS}")
-file(GENERATE OUTPUT ${KOKKOS_COMPILE_OPTIONS_FILE} CONTENT "${kokkos_compile_options}")
+
+string(REPLACE ";" " " kokkos_compile_options_raw "${KOKKOS_COMPILE_OPTIONS}")
+string(REPLACE "$<$<COMPILE_LANGUAGE:CXX>:" "" opts_no_start "${kokkos_compile_options_raw}")
+string(REPLACE ">" "" opts_clean "${opts_no_start}")
+
+file(GENERATE OUTPUT ${KOKKOS_COMPILE_OPTIONS_FILE} CONTENT "${opts_clean}")
 
 #file(GENERATE OUTPUT ${KOKKOS_CORE_LIB_FILE} CONTENT "${KOKKOS_LIB_DIRS}")
 #file(GENERATE OUTPUT ${KOKKOS_CONTAINER_LIB_FILE} CONTENT "${KOKKOS_LIB_CONTAINERS}")
@@ -284,6 +291,61 @@ if(ENABLE_OPENSSL)
 endif(ENABLE_OPENSSL)
 
 find_package(Threads REQUIRED)
+
+#----------------------------------------------------------------------------#
+# HDF5 (Merged Implementation)
+#----------------------------------------------------------------------------#
+
+if(VPIC_ENABLE_HDF5)
+  enable_language(C)
+  set(HDF5_PREFER_PARALLEL ON)
+  
+  # 1. Find the package (Returns targets like 'hdf5-shared')
+  find_package(HDF5 COMPONENTS C HL REQUIRED)
+
+  add_definitions(-DVPIC_ENABLE_HDF5)
+  include_directories(${HDF5_INCLUDE_DIRS})
+
+  # 2. RESOLVE TARGETS TO PATHS (Dynamic Wrapper Interrogation)
+  set(HDF5_REAL_PATHS "")
+
+  # Interrogate the parallel wrapper directly to get the true linker paths
+  find_program(H5PCC_EXECUTABLE h5pcc)
+  if(H5PCC_EXECUTABLE)
+      execute_process(
+          COMMAND ${H5PCC_EXECUTABLE} -show
+          OUTPUT_VARIABLE H5PCC_SHOW_OUTPUT
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+      )
+      
+      # Extract the -L directory flag from the output string using Regex
+      string(REGEX MATCH "-L[^ ]*" HDF5_TRUE_LIB_DIR "${H5PCC_SHOW_OUTPUT}")
+      
+      if(HDF5_TRUE_LIB_DIR)
+          list(APPEND HDF5_REAL_PATHS "${HDF5_TRUE_LIB_DIR}")
+      else()
+          message(WARNING "VPIC: Found h5pcc but could not extract -L path.")
+      endif()
+  else()
+      message(WARNING "VPIC: h5pcc not found in PATH. Falling back to system paths.")
+  endif()
+
+  # Safely append the standard linker flags
+  list(APPEND HDF5_REAL_PATHS "-lhdf5_hl" "-lhdf5")
+
+  # 3. Add the Resolved Paths to VPIC
+  # Convert list to space-separated string to keep the shell wrapper happy
+  string(REPLACE ";" " " HDF5_LIB_STRING "${HDF5_REAL_PATHS}")
+  set(VPIC_CXX_LIBRARIES "${VPIC_CXX_LIBRARIES} ${HDF5_LIB_STRING}")
+
+  # Status Reporting
+  if(HDF5_IS_PARALLEL)
+    message(STATUS "VPIC: HDF5 Parallel Enabled")
+    add_definitions(-DVPIC_HDF5_PARALLEL)
+  else()
+    message(STATUS "VPIC: HDF5 Serial Enabled")
+  endif()
+endif()
 
 #------------------------------------------------------------------------------#
 # Act on build options set in project.cmake
