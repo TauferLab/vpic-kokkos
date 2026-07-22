@@ -801,7 +801,9 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params, field_array_t* f
         int nx=g->nx, ny=g->ny, nz=g->nz;
         using P = Kokkos::MDRangePolicy<Kokkos::DefaultHostExecutionSpace, Kokkos::Rank<3>>;
         
-        Kokkos::parallel_for("PackFieldsSinglePass", P({1,1,1}, {nz+1,ny+1,nx+1}), KOKKOS_LAMBDA(int k, int j, int i) {
+        Kokkos::parallel_for("PackFieldsSinglePass", 
+            P({1,1,1}, {nz+1,ny+1,nx+1}), 
+            [&](int k, int j, int i) {
             size_t bidx = ((k-1)*ny*nx) + ((j-1)*nx) + (i-1);
             char* cell_base = (char*)&f_base[voxel(i,j,k)];
             for(int v=0; v<num_active; ++v) {
@@ -975,7 +977,9 @@ void vpic_simulation::write_hydro_hdf5(DumpParameters& params, hydro_array_t* ha
         int nx=g->nx, ny=g->ny, nz=g->nz;
         using P = Kokkos::MDRangePolicy<Kokkos::DefaultHostExecutionSpace, Kokkos::Rank<3>>;
         
-        Kokkos::parallel_for("PackHydroSinglePass", P({1,1,1}, {nz+1,ny+1,nx+1}), KOKKOS_LAMBDA(int k, int j, int i) {
+        Kokkos::parallel_for("PackHydroSinglePass",
+            P({1,1,1}, {nz+1,ny+1,nx+1}), 
+            [&](int k, int j, int i) {
             size_t bidx = ((k-1)*ny*nx) + ((j-1)*nx) + (i-1);
             char* cell_base = (char*)&h_base[voxel(i,j,k)];
             for(int v=0; v<num_active; ++v) {

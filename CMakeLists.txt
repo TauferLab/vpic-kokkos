@@ -169,6 +169,21 @@ if(ENABLE_KOKKOS_CUDA)
   find_package(CUDA)
   if (CUDA_FOUND)
     add_definitions(-DENABLE_KOKKOS_CUDA)
+
+    # --- Ensure the CUDA driver library (libcuda) is linked into deck builds ---
+    find_library(CUDA_DRIVER_LIB cuda
+      HINTS
+        ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs
+        /usr/lib64
+    )
+    if(CUDA_DRIVER_LIB)
+      get_filename_component(_cuda_dir "${CUDA_DRIVER_LIB}" DIRECTORY)
+      string(APPEND VPIC_CXX_LIBRARIES " -L${_cuda_dir} -lcuda ")
+      message(STATUS "Added CUDA driver lib: ${CUDA_DRIVER_LIB}")
+    else()
+      message(WARNING "libcuda not found; deck link may fail")
+    endif()
+
     # If not on a Cray system, this can cause CMake to stall
     if(DEFINED ENV{CRAYPE_VERSION})
       set(ENV{NVCC_WRAPPER_DEFAULT_COMPILER} ${CMAKE_CXX_COMPILER})
@@ -281,52 +296,67 @@ find_package(Threads REQUIRED)
 if(VPIC_ENABLE_HDF5)
   enable_language(C)
   set(HDF5_PREFER_PARALLEL ON)
-  
-  # 1. Find the package (Returns targets like 'hdf5-shared')
+
   find_package(HDF5 COMPONENTS C HL REQUIRED)
 
-  add_definitions(-DVPIC_ENABLE_HDF5)
+  # Fail loudly at configure time instead of at link time
+  if(NOT HDF5_IS_PARALLEL)
+    message(FATAL_ERROR
+      "VPIC_ENABLE_HDF5 needs PARALLEL HDF5 but found SERIAL at: "
+      "${HDF5_C_LIBRARIES}. Set HDF5_ROOT to your parallel build "
+      "(or load the parallel hdf5 module) and reconfigure.")
+  endif()
+
+  add_definitions(-DVPIC_ENABLE_HDF5 -DVPIC_HDF5_PARALLEL)
   include_directories(${HDF5_INCLUDE_DIRS})
+  message(STATUS "VPIC: HDF5 Parallel Enabled (${HDF5_C_LIBRARIES})")
 
-  # 2. RESOLVE TARGETS TO PATHS (Dynamic Wrapper Interrogation)
-  set(HDF5_REAL_PATHS "")
+  # ---- include flags for the wrapper ----
+  foreach(d IN LISTS HDF5_INCLUDE_DIRS)
+    string(APPEND VPIC_CXX_FLAGS " -I${d}")
+  endforeach()
 
-  # Interrogate the parallel wrapper directly to get the true linker paths
-  find_program(H5PCC_EXECUTABLE h5pcc)
-  if(H5PCC_EXECUTABLE)
-      execute_process(
-          COMMAND ${H5PCC_EXECUTABLE} -show
-          OUTPUT_VARIABLE H5PCC_SHOW_OUTPUT
-          OUTPUT_STRIP_TRAILING_WHITESPACE
-      )
-      
-      # Extract the -L directory flag from the output string using Regex
-      string(REGEX MATCH "-L[^ ]*" HDF5_TRUE_LIB_DIR "${H5PCC_SHOW_OUTPUT}")
-      
-      if(HDF5_TRUE_LIB_DIR)
-          list(APPEND HDF5_REAL_PATHS "${HDF5_TRUE_LIB_DIR}")
-      else()
-          message(WARNING "VPIC: Found h5pcc but could not extract -L path.")
+  # ---- link flags for the wrapper: use FULL absolute paths ----
+  # HL first, then C (dependency order). Absolute paths sidestep the
+  # /lib64 serial-libhdf5 vs parallel search-order problem entirely.
+    # ---- resolve HDF5 libs to absolute paths for the wrapper string ----
+    set(_hdf5_link "")
+  set(_hdf5_rpath_dirs "")
+
+  foreach(lib IN LISTS HDF5_HL_LIBRARIES HDF5_C_LIBRARIES)
+    set(_resolved "")
+
+    if(TARGET "${lib}")
+      # imported target (config-package case): hdf5-shared / hdf5_hl-shared
+      get_target_property(_resolved "${lib}" IMPORTED_LOCATION)
+      if(NOT _resolved)
+        get_target_property(_cfgs "${lib}" IMPORTED_CONFIGURATIONS)
+        if(_cfgs)
+          list(GET _cfgs 0 _first_cfg)
+          get_target_property(_resolved "${lib}" IMPORTED_LOCATION_${_first_cfg})
+        endif()
       endif()
-  else()
-      message(WARNING "VPIC: h5pcc not found in PATH. Falling back to system paths.")
+    elseif(IS_ABSOLUTE "${lib}")
+      set(_resolved "${lib}")
+    endif()
+
+    if(_resolved)
+      string(APPEND _hdf5_link "${_resolved} ")
+      get_filename_component(_d "${_resolved}" DIRECTORY)
+      list(APPEND _hdf5_rpath_dirs "${_d}")
+    else()
+      string(APPEND _hdf5_link "-l${lib} ")
+    endif()
+  endforeach()
+
+  if(_hdf5_rpath_dirs)
+    list(REMOVE_DUPLICATES _hdf5_rpath_dirs)
+    foreach(d IN LISTS _hdf5_rpath_dirs)
+      string(APPEND VPIC_CXX_LIBRARIES " -Wl,-rpath,${d} -L${d} ")
+    endforeach()
   endif()
 
-  # Safely append the standard linker flags
-  list(APPEND HDF5_REAL_PATHS "-lhdf5_hl" "-lhdf5")
-
-  # 3. Add the Resolved Paths to VPIC
-  # Convert list to space-separated string to keep the shell wrapper happy
-  string(REPLACE ";" " " HDF5_LIB_STRING "${HDF5_REAL_PATHS}")
-  set(VPIC_CXX_LIBRARIES "${VPIC_CXX_LIBRARIES} ${HDF5_LIB_STRING}")
-
-  # Status Reporting
-  if(HDF5_IS_PARALLEL)
-    message(STATUS "VPIC: HDF5 Parallel Enabled")
-    add_definitions(-DVPIC_HDF5_PARALLEL)
-  else()
-    message(STATUS "VPIC: HDF5 Serial Enabled")
-  endif()
+  string(APPEND VPIC_CXX_LIBRARIES "${_hdf5_link}")
 endif()
 
 #------------------------------------------------------------------------------#
