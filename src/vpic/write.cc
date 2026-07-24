@@ -47,6 +47,7 @@ static void ensure_directory(const char* path) {
  * This header precedes all data in VPIC binary dump files and contains
  * metadata necessary for interpreting the file contents.
  */
+
 struct BinaryHeader {
     int32_t magic;      ///< File format identifier (0xBEEF0002)
     int32_t version;    ///< Format version number (currently 1)
@@ -896,7 +897,7 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
         // Allocate output buffer for physical mode (7 floats per particle)
         float* output_buf = nullptr;
         if (compute_physical_position) {
-            MALLOC_ALIGNED(output_buf, PBUF_SIZE * 7 * sizeof(float), 128);
+            MALLOC_ALIGNED(output_buf, PBUF_SIZE * 7, 128);
         }
 
         auto& k_p_h = sp->k_p_h;

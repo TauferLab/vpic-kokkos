@@ -290,73 +290,109 @@ endif(ENABLE_OPENSSL)
 find_package(Threads REQUIRED)
 
 #----------------------------------------------------------------------------#
-# HDF5 (Merged Implementation)
+# HDF5 Configuration
 #----------------------------------------------------------------------------#
 
 if(VPIC_ENABLE_HDF5)
   enable_language(C)
   set(HDF5_PREFER_PARALLEL ON)
-
+  
+  # Find HDF5 package
   find_package(HDF5 COMPONENTS C HL REQUIRED)
 
-  # Fail loudly at configure time instead of at link time
-  if(NOT HDF5_IS_PARALLEL)
-    message(FATAL_ERROR
-      "VPIC_ENABLE_HDF5 needs PARALLEL HDF5 but found SERIAL at: "
-      "${HDF5_C_LIBRARIES}. Set HDF5_ROOT to your parallel build "
-      "(or load the parallel hdf5 module) and reconfigure.")
-  endif()
-
-  add_definitions(-DVPIC_ENABLE_HDF5 -DVPIC_HDF5_PARALLEL)
+  add_definitions(-DVPIC_ENABLE_HDF5)
   include_directories(${HDF5_INCLUDE_DIRS})
-  message(STATUS "VPIC: HDF5 Parallel Enabled (${HDF5_C_LIBRARIES})")
 
-  # ---- include flags for the wrapper ----
-  foreach(d IN LISTS HDF5_INCLUDE_DIRS)
-    string(APPEND VPIC_CXX_FLAGS " -I${d}")
-  endforeach()
+  # -----------------------------------------------------------------------------
+  # RESOLVE HDF5 LIBRARIES (h5pcc Interrogation + CMake Fallback)
+  # -----------------------------------------------------------------------------
+  set(HDF5_VPIC_LIBS "")  # This will hold actual library objects for target_link_libraries
 
-  # ---- link flags for the wrapper: use FULL absolute paths ----
-  # HL first, then C (dependency order). Absolute paths sidestep the
-  # /lib64 serial-libhdf5 vs parallel search-order problem entirely.
-    # ---- resolve HDF5 libs to absolute paths for the wrapper string ----
-    set(_hdf5_link "")
-  set(_hdf5_rpath_dirs "")
-
-  foreach(lib IN LISTS HDF5_HL_LIBRARIES HDF5_C_LIBRARIES)
-    set(_resolved "")
-
-    if(TARGET "${lib}")
-      # imported target (config-package case): hdf5-shared / hdf5_hl-shared
-      get_target_property(_resolved "${lib}" IMPORTED_LOCATION)
-      if(NOT _resolved)
-        get_target_property(_cfgs "${lib}" IMPORTED_CONFIGURATIONS)
-        if(_cfgs)
-          list(GET _cfgs 0 _first_cfg)
-          get_target_property(_resolved "${lib}" IMPORTED_LOCATION_${_first_cfg})
-        endif()
+  find_program(H5PCC_EXECUTABLE h5pcc)
+  if(H5PCC_EXECUTABLE)
+      execute_process(
+          COMMAND ${H5PCC_EXECUTABLE} -show
+          OUTPUT_VARIABLE H5PCC_SHOW_OUTPUT
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+      )
+      
+      message(STATUS "VPIC: h5pcc output: ${H5PCC_SHOW_OUTPUT}")
+      
+      # Extract -L directory using regex (captures the path after -L)
+      string(REGEX MATCH "-L([^ ]+)" HDF5_L_MATCH "${H5PCC_SHOW_OUTPUT}")
+      
+      if(CMAKE_MATCH_1)
+          set(HDF5_LIB_PATH "${CMAKE_MATCH_1}")
+          message(STATUS "VPIC: HDF5 library path extracted: ${HDF5_LIB_PATH}")
+          
+          # Try to find the actual library files
+          find_library(HDF5_HL_LIBRARY 
+                       NAMES hdf5_hl libhdf5_hl 
+                       PATHS ${HDF5_LIB_PATH} 
+                       NO_DEFAULT_PATH)
+          find_library(HDF5_LIBRARY 
+                       NAMES hdf5 libhdf5 
+                       PATHS ${HDF5_LIB_PATH} 
+                       NO_DEFAULT_PATH)
+          
+          if(HDF5_HL_LIBRARY AND HDF5_LIBRARY)
+              # Found actual paths - use them (best option, enables RPATH)
+              list(APPEND HDF5_VPIC_LIBS ${HDF5_HL_LIBRARY} ${HDF5_LIBRARY})
+              message(STATUS "VPIC: HDF5 libraries found:")
+              message(STATUS "  HL: ${HDF5_HL_LIBRARY}")
+              message(STATUS "  Core: ${HDF5_LIBRARY}")
+          else()
+              # find_library failed - let linker search using -L flag
+              message(WARNING "VPIC: find_library failed. Using linker flags.")
+              link_directories(${HDF5_LIB_PATH})
+              list(APPEND HDF5_VPIC_LIBS "hdf5_hl" "hdf5")
+          endif()
+      else()
+          message(WARNING "VPIC: Could not extract -L path from h5pcc output")
+          list(APPEND HDF5_VPIC_LIBS "hdf5_hl" "hdf5")
       endif()
-    elseif(IS_ABSOLUTE "${lib}")
-      set(_resolved "${lib}")
-    endif()
-
-    if(_resolved)
-      string(APPEND _hdf5_link "${_resolved} ")
-      get_filename_component(_d "${_resolved}" DIRECTORY)
-      list(APPEND _hdf5_rpath_dirs "${_d}")
-    else()
-      string(APPEND _hdf5_link "-l${lib} ")
-    endif()
-  endforeach()
-
-  if(_hdf5_rpath_dirs)
-    list(REMOVE_DUPLICATES _hdf5_rpath_dirs)
-    foreach(d IN LISTS _hdf5_rpath_dirs)
-      string(APPEND VPIC_CXX_LIBRARIES " -Wl,-rpath,${d} -L${d} ")
-    endforeach()
+  else()
+      # No h5pcc found - try CMake's discovered libraries
+      if(HDF5_LIBRARIES)
+          set(HDF5_VPIC_LIBS ${HDF5_LIBRARIES})
+          message(STATUS "VPIC: Using CMake-discovered HDF5 libraries: ${HDF5_LIBRARIES}")
+      else()
+          # Last resort: bare library names
+          list(APPEND HDF5_VPIC_LIBS "hdf5_hl" "hdf5")
+          message(WARNING "VPIC: h5pcc not found, using default library names")
+      endif()
   endif()
 
-  string(APPEND VPIC_CXX_LIBRARIES "${_hdf5_link}")
+  # -----------------------------------------------------------------------------
+  # ADD TO SHELL WRAPPER (Keep existing behavior for bin/vpic script)
+  # -----------------------------------------------------------------------------
+  # Convert to space-separated string for the wrapper script
+  # Convert to space-separated string for the wrapper script
+  string(REPLACE ";" " " HDF5_LIB_STRING "${HDF5_VPIC_LIBS}")
+
+  # Determine the directory containing the HDF5 libs so we can bake an rpath.
+  # Prefer the path extracted from h5pcc; otherwise derive it from the
+  # resolved library file.
+  set(HDF5_RPATH_DIR "")
+  if(DEFINED HDF5_LIB_PATH)
+    set(HDF5_RPATH_DIR "${HDF5_LIB_PATH}")
+  elseif(HDF5_LIBRARY)
+    get_filename_component(HDF5_RPATH_DIR "${HDF5_LIBRARY}" DIRECTORY)
+  endif()
+
+  if(HDF5_RPATH_DIR)
+    set(VPIC_CXX_LIBRARIES "${VPIC_CXX_LIBRARIES} -L${HDF5_RPATH_DIR} -Wl,-rpath,${HDF5_RPATH_DIR} ${HDF5_LIB_STRING}")
+  else()
+    set(VPIC_CXX_LIBRARIES "${VPIC_CXX_LIBRARIES} ${HDF5_LIB_STRING}")
+  endif()
+
+  # Status Reporting
+  if(HDF5_IS_PARALLEL)
+    message(STATUS "VPIC: HDF5 Parallel Enabled")
+    add_definitions(-DVPIC_HDF5_PARALLEL)
+  else()
+    message(STATUS "VPIC: HDF5 Serial Enabled")
+  endif()
 endif()
 
 #------------------------------------------------------------------------------#
@@ -536,6 +572,10 @@ else()
 endif()
 target_include_directories(vpic INTERFACE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(vpic ${VPIC_EXPOSE} ${MPI_CXX_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${OPENSSL_LIBRARIES} ${CMAKE_DL_LIBS} Kokkos::kokkos)
+# Link HDF5 if enabled
+if(VPIC_ENABLE_HDF5 AND HDF5_VPIC_LIBS)
+  target_link_libraries(vpic ${VPIC_EXPOSE} ${HDF5_VPIC_LIBS})
+endif()
 target_compile_options(vpic ${VPIC_EXPOSE} ${MPI_C_COMPILE_FLAGS} ${KOKKOS_COMPILE_OPTIONS})
 
 macro(build_a_vpic name deck)
