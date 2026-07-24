@@ -23,6 +23,31 @@ if(NOT Python3_EXECUTABLE)
 endif()
 
 # ==============================================================================
+# SLURM DETECTION & LAUNCHER OVERRIDE
+# ==============================================================================
+# On SLURM systems, raw mpiexec doesn't respect partial node allocations.
+# Use srun (the native SLURM launcher) when available.
+# ==============================================================================
+
+if(DEFINED ENV{SLURM_JOB_ID})
+  find_program(SRUN_EXECUTABLE srun)
+  
+  if(SRUN_EXECUTABLE)
+    set(MPIEXEC ${SRUN_EXECUTABLE} CACHE FILEPATH "MPI launcher (overridden for SLURM)" FORCE)
+    set(MPIEXEC_NUMPROC_FLAG "-n" CACHE STRING "Flag for number of processes" FORCE)
+    
+    message(STATUS "===============================================")
+    message(STATUS "DETECTED SLURM ENVIRONMENT")
+    message(STATUS "  Job ID:$ENV{SLURM_JOB_ID}")
+    message(STATUS "  Using srun instead of mpiexec for tests")
+    message(STATUS "  MPI Launcher: ${SRUN_EXECUTABLE}")
+    message(STATUS "===============================================")
+  else()
+    message(WARNING "SLURM detected but srun not found in PATH!")
+  endif()
+endif()
+
+# ==============================================================================
 # MPI OVERSUBSCRIPTION DETECTION
 # ==============================================================================
 # Different MPI implementations handle oversubscription differently:
