@@ -429,6 +429,81 @@ public:
   void hydro_dump(const char * speciesname, DumpParameters & dumpParams);
   void fluid_dump(const char * speciesname, DumpParameters & dumpParams);
 
+
+  // =============================================================================
+  // BINARY WRITE INTERFACE
+  // =============================================================================
+
+  /**
+   * @brief Write electromagnetic fields to binary format (M2M - one file per rank)
+   * @param params Dump configuration (output variables, directory, filename)
+   * @param fa Field array containing E and B components
+   */
+  void write_fields_binary(DumpParameters& params, field_array_t* fa);
+
+  /**
+   * @brief Write hydrodynamic moments to binary format (M2M - one file per rank)
+   * @param params Dump configuration (output variables, directory, filename)
+   * @param ha Hydro array for moment storage
+   * @param species_name Species to compute moments for (triggers physics accumulation)
+   */
+  void write_hydro_binary(DumpParameters& params, hydro_array_t* ha, const char* species_name);
+
+  /**
+   * @brief Write particle data to binary format (M2M - one file per rank)
+   * @param fbase Base filename (without extension)
+   * @param species_name Species to dump
+   * @param compute_physical_position If true, output physical (x,y,z) coords; 
+   *                                   if false, output logical (dx,dy,dz) + voxel index
+   */
+  void write_particles_binary(const char* fbase, 
+                              const char* species_name, 
+                              bool compute_physical_position = false);
+
+  #ifdef VPIC_ENABLE_HDF5
+  // =============================================================================
+  // HDF5 WRITE INTERFACE
+  // =============================================================================
+
+  /**
+   * @brief Write electromagnetic fields to HDF5 format
+   * @param params Dump configuration (output variables, directory, filename)
+   * @param fa Field array containing E and B components
+   * @param single_file If true, use M2O (single shared file with parallel I/O);
+   *                    if false, use M2M (one file per rank)
+   */
+  void write_fields_hdf5(DumpParameters& params, 
+                        field_array_t* fa, 
+                        bool single_file = false);
+
+  /**
+   * @brief Write hydrodynamic moments to HDF5 format
+   * @param params Dump configuration (output variables, directory, filename)
+   * @param ha Hydro array for moment storage
+   * @param species_name Species to compute moments for (triggers physics accumulation)
+   * @param single_file If true, use M2O (single shared file with parallel I/O);
+   *                    if false, use M2M (one file per rank)
+   */
+  void write_hydro_hdf5(DumpParameters& params, 
+                        hydro_array_t* ha, 
+                        const char* species_name, 
+                        bool single_file = false);
+
+  /**
+   * @brief Write particle data to HDF5 format
+   * @param fbase Base filename (without extension)
+   * @param species_name Species to dump
+   * @param single_file If true, use M2O (single shared file with parallel I/O);
+   *                    if false, use M2M (one file per rank)
+   * @param compute_physical_position If true, output physical (x,y,z) coords;
+   *                                   if false, output logical (dx,dy,dz) + voxel index
+   */
+  void write_particles_hdf5(const char* fbase, 
+                            const char* species_name, 
+                            bool single_file = false,
+                            bool compute_physical_position = false);
+  #endif // VPIC_ENABLE_HDF5
+
   ///////////////////
   // Useful accessors
 
