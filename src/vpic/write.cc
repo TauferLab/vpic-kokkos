@@ -239,7 +239,7 @@ void vpic_simulation::write_hydro_binary(DumpParameters& params,
             {4,  (int)offsetof(hydro_t, px)},   // Momentum
             {5,  (int)offsetof(hydro_t, py)},
             {6,  (int)offsetof(hydro_t, pz)},
-            {7,  (int)offsetof(hydro_t, ke)},   // Kinetic energy
+            {7,  (int)offsetof(hydro_t, rho_m)},   // Kinetic energy
             {8,  (int)offsetof(hydro_t, txx)},  // Stress tensor
             {9,  (int)offsetof(hydro_t, tyy)},
             {10, (int)offsetof(hydro_t, tzz)},
@@ -435,21 +435,26 @@ void vpic_simulation::write_particles_binary(const char* fbase,
         auto& k_p_h = sp->k_p_h;
         auto& k_p_i_h = sp->k_p_i_h;
         int sp_np = sp->np;
-        int sp_max_np = sp->max_np;
 
-        // Precompute grid parameters for physical coordinate conversion
-        // UNVOXEL macro will be used: converts voxel index → (i,j,k)
+        // Grid parameters for coordinate transformation
         int nx = g->nx, ny = g->ny, nz = g->nz;
         float dx = g->dx, dy = g->dy, dz = g->dz;
         float x0 = g->x0, y0 = g->y0, z0 = g->z0;
 
+        // ======================================================================
+        // CENTER ALL PARTICLES ONCE (outside loop)
+        // ======================================================================
+        center_p(sp, interpolator_array);
+        Kokkos::fence();
+
+        // ======================================================================
+        // WRITE IN BATCHES
+        // ======================================================================
         for(int buf_start = 0; buf_start < sp_np; buf_start += PBUF_SIZE) {
             
-            // Adjust species counts for this chunk
-            sp->np = sp_np - buf_start;
-            if(sp->np > PBUF_SIZE) sp->np = PBUF_SIZE;
-            sp->max_np = PBUF_SIZE;
-
+            // Calculate chunk size
+            int chunk_size = std::min(sp_np - buf_start, PBUF_SIZE);
+            
             // -----------------------------------------------------------------
             // Sub-phase 3a: Copy Chunk to Aligned Buffer
             // -----------------------------------------------------------------
@@ -457,7 +462,7 @@ void vpic_simulation::write_particles_binary(const char* fbase,
                 pbuf_view(p_buf, PBUF_SIZE);
             
             Kokkos::parallel_for("PopulateParticleDumpBuffer",
-                Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, sp->np),
+                Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, chunk_size),
                 KOKKOS_LAMBDA(int i) {
                     int idx = buf_start + i;
                     pbuf_view(i).dx = k_p_h(idx, particle_var::dx);
@@ -472,33 +477,18 @@ void vpic_simulation::write_particles_binary(const char* fbase,
             Kokkos::fence();
 
             // -----------------------------------------------------------------
-            // Sub-phase 3b: Time-Centering & Ghost Filtering
+            // Sub-phase 3b: Coordinate Transformation (Physical Mode Only)
             // -----------------------------------------------------------------
-            // center_p_dump() performs two critical operations:
-            // 1. Centers particle velocities to current timestep
-            // 2. Removes ghost particles, updating sp->np to valid count
-            center_p_dump(sp, p_buf, interpolator_array);
-
-            // -----------------------------------------------------------------
-            // Sub-phase 3c: Coordinate Transformation (Physical Mode Only)
-            // -----------------------------------------------------------------
-            if (compute_physical_position && sp->np > 0) {
+            if (compute_physical_position) {
                 // Transform (dx,dy,dz,i) → (x,y,z) in-place
-                // After this, p_buf[n].dx/dy/dz contain physical coordinates
-                // and p_buf[n].i becomes meaningless (won't be written)
-                
-                for(int n = 0; n < sp->np; ++n) {
+                for(int n = 0; n < chunk_size; ++n) {
                     int voxel_idx = p_buf[n].i;
                     
                     // Convert voxel index to (i,j,k) grid coordinates
-                    // UNVOXEL macro: extracts cell indices from flat voxel index
                     int ix, iy, iz;
                     UNVOXEL(voxel_idx, ix, iy, iz, nx, ny, nz);
                     
                     // Transform to physical position
-                    // Cell center is at integer (ix,iy,iz), particle offset in [-1,1]
-                    // Formula: global = origin + (cell_index - 1 + 0.5*(1 + local_offset)) * cell_size
-                    // The "-1" accounts for ghost cell at index 0
                     p_buf[n].dx = x0 + (ix - 1 + 0.5f * (1.0f + p_buf[n].dx)) * dx;
                     p_buf[n].dy = y0 + (iy - 1 + 0.5f * (1.0f + p_buf[n].dy)) * dy;
                     p_buf[n].dz = z0 + (iz - 1 + 0.5f * (1.0f + p_buf[n].dz)) * dz;
@@ -506,29 +496,28 @@ void vpic_simulation::write_particles_binary(const char* fbase,
             }
 
             // -----------------------------------------------------------------
-            // Sub-phase 3d: Write Chunk to File
+            // Sub-phase 3c: Write Chunk to File
             // -----------------------------------------------------------------
-            if(sp->np > 0) {
-                if (compute_physical_position) {
-                    // Physical mode: Write only x,y,z,ux,uy,uz,w (skip voxel index)
-                    for(int n = 0; n < sp->np; ++n) {
-                        fwrite(&p_buf[n].dx, sizeof(float), 3, fp);  // x,y,z
-                        fwrite(&p_buf[n].ux, sizeof(float), 4, fp);  // ux,uy,uz,w
-                    }
-                } else {
-                    // Logical mode: Write full struct including voxel index
-                    fwrite(p_buf, sizeof(particle_t), sp->np, fp);
+            if (compute_physical_position) {
+                // Physical mode: Write only x,y,z,ux,uy,uz,w (skip voxel index)
+                for(int n = 0; n < chunk_size; ++n) {
+                    fwrite(&p_buf[n].dx, sizeof(float), 3, fp);  // x,y,z
+                    fwrite(&p_buf[n].ux, sizeof(float), 4, fp);  // ux,uy,uz,w
                 }
+            } else {
+                // Logical mode: Write full struct including voxel index
+                fwrite(p_buf, sizeof(particle_t), chunk_size, fp);
             }
         }
 
-        // =====================================================================
-        // PHASE 4: CLEANUP & METRICS
-        // =====================================================================
-        
-        // Restore species state
-        sp->np = sp_np;
-        sp->max_np = sp_max_np;
+        // ======================================================================
+        // UNCENTER ALL PARTICLES ONCE (outside loop)
+        // ======================================================================
+        uncenter_p(sp, interpolator_array);
+
+        // ======================================================================
+        // CLEANUP
+        // ======================================================================
         FREE_ALIGNED(p_buf);
         fclose(fp);
 
@@ -890,11 +879,10 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
         // Process in 2M particle chunks. Each chunk undergoes:
         // Copy → Time-Center → Convert (if physical) → Write
         
-        const int PBUF_SIZE = 2097152;  // 2M particles ≈ 64MB chunks
+        const int PBUF_SIZE = 2097152;
         particle_t* p_buf;
         MALLOC_ALIGNED(p_buf, PBUF_SIZE, 128);
 
-        // Allocate output buffer for physical mode (7 floats per particle)
         float* output_buf = nullptr;
         if (compute_physical_position) {
             MALLOC_ALIGNED(output_buf, PBUF_SIZE * 7, 128);
@@ -903,12 +891,17 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
         auto& k_p_h = sp->k_p_h;
         auto& k_p_i_h = sp->k_p_i_h;
         int sp_np = sp->np;
-        int sp_max_np = sp->max_np;
 
-        // Precompute grid parameters for coordinate transformation
+        // Grid parameters
         int nx = g->nx, ny = g->ny, nz = g->nz;
         float dx = g->dx, dy = g->dy, dz = g->dz;
         float x0 = g->x0, y0 = g->y0, z0 = g->z0;
+
+        // ======================================================================
+        // CENTER ALL PARTICLES ONCE (outside loop)
+        // ======================================================================
+        center_p(sp, interpolator_array);
+        Kokkos::fence();
 
         // Synchronize loop count for collective I/O
         double local_loops = (double)((sp_np + PBUF_SIZE - 1) / PBUF_SIZE);
@@ -917,26 +910,24 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
         mp_allmax_d(&local_loops, &max_loops_d, 1);
         int total_loops = single_file ? (int)max_loops_d : (int)local_loops;
 
+        // ======================================================================
+        // WRITE IN BATCHES
+        // ======================================================================
         for(int loop_idx = 0; loop_idx < total_loops; ++loop_idx) {
             int buf_start = loop_idx * PBUF_SIZE;
             hsize_t chunk_valid_count = 0;
 
             if (buf_start < sp_np) {
-                // Adjust species counts for this chunk
-                sp->np = sp_np - buf_start;
-                if(sp->np > PBUF_SIZE) sp->np = PBUF_SIZE;
-                sp->max_np = PBUF_SIZE;
-
-                // -------------------------------------------------------------
-                // Sub-phase 3a: Copy Chunk to Buffer
-                // -------------------------------------------------------------
+                chunk_valid_count = std::min(static_cast<hsize_t>(sp_np - buf_start), static_cast<hsize_t>(PBUF_SIZE));
+                
                 double t_loop_start = wallclock();
                 
+                // Copy particles (already centered!)
                 Kokkos::View<particle_t*, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
                     pbuf_view(p_buf, PBUF_SIZE);
                 
                 Kokkos::parallel_for("PopulateParticleDumpBuffer",
-                    Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, sp->np),
+                    Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, chunk_valid_count),
                     KOKKOS_LAMBDA(int i) {
                         int idx = buf_start + i;
                         pbuf_view(i).dx = k_p_h(idx, particle_var::dx);
@@ -952,58 +943,37 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
                 
                 t_buf_pack += (wallclock() - t_loop_start);
 
-                // -------------------------------------------------------------
-                // Sub-phase 3b: Time-Centering & Ghost Removal
-                // -------------------------------------------------------------
-                // center_p_dump() filters ghosts and updates sp->np to valid count
-                t_loop_start = wallclock();
-                center_p_dump(sp, p_buf, interpolator_array);
-                chunk_valid_count = sp->np;
-                t_compute += (wallclock() - t_loop_start);
-
-                // -------------------------------------------------------------
-                // Sub-phase 3c: Coordinate Transformation (Physical Mode Only)
-                // -------------------------------------------------------------
-                if (compute_physical_position && chunk_valid_count > 0) {
-                    // Transform (dx,dy,dz,i) → (x,y,z) and repack into output buffer
-                    // Output layout: [x, y, z, ux, uy, uz, w] per particle
-                    
+                // Coordinate transformation (if needed)
+                if (compute_physical_position) {
+                    t_loop_start = wallclock();
                     float* out = (float*)output_buf;
                     
                     for(hsize_t n = 0; n < chunk_valid_count; ++n) {
                         int voxel_idx = p_buf[n].i;
-                        
-                        // Decompose voxel index into (i,j,k) using UNVOXEL macro
                         int ix, iy, iz;
                         UNVOXEL(voxel_idx, ix, iy, iz, nx, ny, nz);
                         
-                        // Convert to physical position
-                        // Particle offset (dx,dy,dz) is in [-1,1] within cell
-                        // Cell center is at integer (ix,iy,iz) where ghost cell is at index 0
-                        // Formula: global = origin + (cell_index - 1 + 0.5*(1 + local_offset)) * cell_size
-                        out[n*7 + 0] = x0 + (ix - 1 + 0.5f * (1.0f + p_buf[n].dx)) * dx;  // x
-                        out[n*7 + 1] = y0 + (iy - 1 + 0.5f * (1.0f + p_buf[n].dy)) * dy;  // y
-                        out[n*7 + 2] = z0 + (iz - 1 + 0.5f * (1.0f + p_buf[n].dz)) * dz;  // z
-                        out[n*7 + 3] = p_buf[n].ux;  // ux
-                        out[n*7 + 4] = p_buf[n].uy;  // uy
-                        out[n*7 + 5] = p_buf[n].uz;  // uz
-                        out[n*7 + 6] = p_buf[n].w;   // w
+                        out[n*7 + 0] = x0 + (ix - 1 + 0.5f * (1.0f + p_buf[n].dx)) * dx;
+                        out[n*7 + 1] = y0 + (iy - 1 + 0.5f * (1.0f + p_buf[n].dy)) * dy;
+                        out[n*7 + 2] = z0 + (iz - 1 + 0.5f * (1.0f + p_buf[n].dz)) * dz;
+                        out[n*7 + 3] = p_buf[n].ux;
+                        out[n*7 + 4] = p_buf[n].uy;
+                        out[n*7 + 5] = p_buf[n].uz;
+                        out[n*7 + 6] = p_buf[n].w;
                     }
+                    t_compute += (wallclock() - t_loop_start);
                 }
             }
 
-            // -----------------------------------------------------------------
-            // Sub-phase 3d: Write Chunk to HDF5
-            // -----------------------------------------------------------------
+            // Write to HDF5
             if (single_file || chunk_valid_count > 0) {
                 double t_loop_start = wallclock();
                 
                 hid_t mspace = H5Screate_simple(1, &chunk_valid_count, NULL);
                 H5Sselect_hyperslab(fspace, H5S_SELECT_SET,
-                                   &current_file_offset, NULL,
-                                   &chunk_valid_count, NULL);
+                                &current_file_offset, NULL,
+                                &chunk_valid_count, NULL);
                 
-                // Select appropriate buffer based on mode
                 void* write_ptr = compute_physical_position ? (void*)output_buf : (void*)p_buf;
                 H5Dwrite(dset_particles, ptype, mspace, fspace, dxpl, write_ptr);
                 
@@ -1013,9 +983,12 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
             }
         }
 
-        // Restore species state
-        sp->np = sp_np;
-        sp->max_np = sp_max_np;
+        // ======================================================================
+        // UNCENTER ALL PARTICLES ONCE (outside loop)
+        // ======================================================================
+        uncenter_p(sp, interpolator_array);
+
+        // Cleanup
         FREE_ALIGNED(p_buf);
         if (output_buf) FREE_ALIGNED(output_buf);
 
@@ -1481,7 +1454,7 @@ void vpic_simulation::write_hydro_hdf5(DumpParameters& params,
             {5,  "py",  offsetof(hydro_t, py)},
             {6,  "pz",  offsetof(hydro_t, pz)},
             // Energy & pressure tensor
-            {7,  "ke",  offsetof(hydro_t, ke)},
+            {7,  "ke",  offsetof(hydro_t, rho_m)},
             {8,  "txx", offsetof(hydro_t, txx)},
             {9,  "tyy", offsetof(hydro_t, tyy)},
             {10, "tzz", offsetof(hydro_t, tzz)},
