@@ -1,6 +1,7 @@
 #include "vpic.h"
 #include <sys/stat.h> // for mkdir
 #include <vector>
+#include <filesystem>
 
 #ifdef VPIC_ENABLE_HDF5
 #include "hdf5.h"
@@ -554,7 +555,7 @@ void vpic_simulation::write_particles_binary(const char* fbase,
 #ifdef VPIC_ENABLE_HDF5
 
 // =============================================================================
-// HDF5 HELPER FUNCTIONS
+// XDMF GENERATION HELPER
 // =============================================================================
 
 /**
@@ -619,6 +620,207 @@ static GlobalGridInfo get_global_grid_info(grid_t* g, bool single_file) {
 
     return info;
 }
+
+/**
+ * @brief XDMF grid metadata (pre-computed, no MPI calls)
+ */
+struct XDMFGridInfo {
+    hsize_t dims[3];      // Grid dimensions [nz, ny, nx]
+    double origin[3];     // Origin [oz, oy, ox] 
+    double spacing[3];    // Cell size [dz, dy, dz]
+};
+
+// Replace entire function starting at line ~78
+/**
+ * @brief Generates XDMF wrapper for HDF5 structured grid data (fields/hydro)
+ * @param xmf_path Output .xmf filename
+ * @param h5_filename Relative path to HDF5 file (from .xmf location)
+ * @param var_names List of dataset names in HDF5 file
+ * @param xinfo Pre-computed grid info (NO MPI CALLS INSIDE THIS FUNCTION)
+ * @param g Grid structure for time metadata only
+ */
+static void write_xdmf_structured(const char* xmf_path,
+                                  const char* h5_filename,
+                                  const std::vector<const char*>& var_names,
+                                  const XDMFGridInfo& xinfo,
+                                  grid_t* g) {
+    FILE* xmf = fopen(xmf_path, "w");
+    if (!xmf) ERROR(("Failed to create XDMF file: %s", xmf_path));
+
+    // Write XDMF header
+    fprintf(xmf, "<?xml version=\"1.0\" ?>\n");
+    fprintf(xmf, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n");
+    fprintf(xmf, "<Xdmf Version=\"3.0\">\n");
+    fprintf(xmf, "  <Domain>\n");
+    fprintf(xmf, "    <Grid Name=\"VPIC\" GridType=\"Uniform\">\n");
+    
+    // Topology: 3D structured grid (IJK ordering)
+    fprintf(xmf, "      <Topology TopologyType=\"3DCoRectMesh\" "
+                 "Dimensions=\"%llu %llu %llu\"/>\n",
+            (unsigned long long)(xinfo.dims[0]+1), 
+            (unsigned long long)(xinfo.dims[1]+1), 
+            (unsigned long long)(xinfo.dims[2]+1));
+    
+    // Geometry: Uniform spacing with origin
+    fprintf(xmf, "      <Geometry GeometryType=\"ORIGIN_DXDYDZ\">\n");
+    fprintf(xmf, "        <DataItem Dimensions=\"3\" NumberType=\"Float\" "
+                 "Precision=\"8\" Format=\"XML\">%g %g %g</DataItem>\n",
+            xinfo.origin[2], xinfo.origin[1], xinfo.origin[0]);  // Z, Y, X order
+    fprintf(xmf, "        <DataItem Dimensions=\"3\" NumberType=\"Float\" "
+                 "Precision=\"8\" Format=\"XML\">%g %g %g</DataItem>\n",
+            xinfo.spacing[2], xinfo.spacing[1], xinfo.spacing[0]);
+    fprintf(xmf, "      </Geometry>\n");
+    
+    // Attributes: Each variable as a scalar field
+    for (const char* var_name : var_names) {
+        fprintf(xmf, "      <Attribute Name=\"%s\" AttributeType=\"Scalar\" "
+                     "Center=\"Cell\">\n", var_name);
+        fprintf(xmf, "        <DataItem Dimensions=\"%llu %llu %llu\" "
+                     "NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n",
+                (unsigned long long)xinfo.dims[0], 
+                (unsigned long long)xinfo.dims[1], 
+                (unsigned long long)xinfo.dims[2]);
+        fprintf(xmf, "          %s:/%s\n", h5_filename, var_name);
+        fprintf(xmf, "        </DataItem>\n");
+        fprintf(xmf, "      </Attribute>\n");
+    }
+    
+    // Add time attribute
+    fprintf(xmf, "      <Time Value=\"%g\"/>\n", g->t0 + g->dt * g->step);
+    
+    fprintf(xmf, "    </Grid>\n");
+    fprintf(xmf, "  </Domain>\n");
+    fprintf(xmf, "</Xdmf>\n");
+    
+    fclose(xmf);
+}
+
+/**
+ * @brief Generates XDMF wrapper for HDF5 particle data (unstructured point cloud)
+ * @param xmf_path Output .xmf filename
+ * @param h5_filename Relative path to HDF5 file
+ * @param particle_count Total number of particles
+ * @param g Grid structure (for time metadata)
+ * @param has_position True if file contains (x,y,z), false if (dx,dy,dz,i)
+ */
+static void write_xdmf_particles(const char* xmf_path,
+                                 const char* h5_filename,
+                                 hsize_t particle_count,
+                                 grid_t* g,
+                                 bool has_position) {
+    FILE* xmf = fopen(xmf_path, "w");
+    if (!xmf) ERROR(("Failed to create XDMF file: %s", xmf_path));
+
+    fprintf(xmf, "<?xml version=\"1.0\" ?>\n");
+    fprintf(xmf, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n");
+    fprintf(xmf, "<Xdmf Version=\"3.0\">\n");
+    fprintf(xmf, "  <Domain>\n");
+    fprintf(xmf, "    <Grid Name=\"Particles\" GridType=\"Uniform\">\n");
+    
+    // Topology: Unstructured point cloud
+    fprintf(xmf, "      <Topology TopologyType=\"Polyvertex\" "
+                 "NumberOfElements=\"%llu\"/>\n", (unsigned long long)particle_count);
+    
+    // Geometry: XYZ positions
+    if (has_position) {
+        // Physical mode: positions are (x, y, z) fields in compound dataset
+        fprintf(xmf, "      <Geometry GeometryType=\"XYZ\">\n");
+        fprintf(xmf, "        <DataItem Dimensions=\"%llu 3\" NumberType=\"Float\" "
+                     "Precision=\"4\" Format=\"HDF\">\n", (unsigned long long)particle_count);
+        fprintf(xmf, "          %s:/particles\n", h5_filename);
+        fprintf(xmf, "        </DataItem>\n");
+        fprintf(xmf, "      </Geometry>\n");
+        
+        // Attributes: Velocity components
+        for (const char* comp : {"ux", "uy", "uz", "w"}) {
+            fprintf(xmf, "      <Attribute Name=\"%s\" AttributeType=\"Scalar\" "
+                         "Center=\"Node\">\n", comp);
+            fprintf(xmf, "        <DataItem ItemType=\"HyperSlab\" Dimensions=\"%llu 1\">\n",
+                    (unsigned long long)particle_count);
+            fprintf(xmf, "          <DataItem Dimensions=\"3 2\" NumberType=\"UInt\" "
+                         "Format=\"XML\">0 %d 1 1 %llu 1</DataItem>\n",
+                    (strcmp(comp, "ux") == 0) ? 3 : 
+                    (strcmp(comp, "uy") == 0) ? 4 :
+                    (strcmp(comp, "uz") == 0) ? 5 : 6,
+                    (unsigned long long)particle_count);
+            fprintf(xmf, "          <DataItem Dimensions=\"%llu 7\" NumberType=\"Float\" "
+                         "Precision=\"4\" Format=\"HDF\">%s:/particles</DataItem>\n",
+                    (unsigned long long)particle_count, h5_filename);
+            fprintf(xmf, "        </DataItem>\n");
+            fprintf(xmf, "      </Attribute>\n");
+        }
+    } else {
+        // Logical mode: Need to warn user or skip geometry
+        fprintf(xmf, "      <!-- Warning: Logical coordinates (dx,dy,dz,i) cannot be "
+                     "directly visualized in ParaView -->\n");
+        fprintf(xmf, "      <!-- Recommend re-running with compute_physical_position=true -->\n");
+        fprintf(xmf, "      <Geometry GeometryType=\"XYZ\">\n");
+        fprintf(xmf, "        <DataItem Dimensions=\"%llu 3\" NumberType=\"Float\" "
+                     "Precision=\"4\" Format=\"XML\">\n", (unsigned long long)particle_count);
+        fprintf(xmf, "          0 0 0  <!-- Placeholder: actual positions unavailable -->\n");
+        fprintf(xmf, "        </DataItem>\n");
+        fprintf(xmf, "      </Geometry>\n");
+    }
+    
+    fprintf(xmf, "      <Time Value=\"%g\"/>\n", g->t0 + g->dt * g->step);
+    fprintf(xmf, "    </Grid>\n");
+    fprintf(xmf, "  </Domain>\n");
+    fprintf(xmf, "</Xdmf>\n");
+    
+    fclose(xmf);
+}
+
+/**
+ * @brief Generates XDMF time series master file using XInclude
+ * @param series_path Output .xmf filename (e.g., "fields_timeseries.xmf")
+ * @param steps Vector of timesteps that were dumped
+ * @param base_pattern Directory structure with %d placeholder (e.g., "fields/T.%d") 
+ * @param base_filename HDF5/XDMF base name (e.g., "fields")
+ */
+#include <filesystem>  // Add to vpic.h or dump.cc
+
+void vpic_simulation::write_xdmf_timeseries(const char* series_path,
+                                            const std::vector<int>& steps,
+                                            const char* base_pattern,
+                                            const char* base_filename) {
+    if (rank() != 0) return;
+
+    FILE* xmf = fopen(series_path, "w");
+    if (!xmf) {
+        MESSAGE(("WARNING: Could not create XDMF time series: %s", series_path));
+        return;
+    }
+
+    fprintf(xmf, "<?xml version=\"1.0\" ?>\n");
+    fprintf(xmf, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n");
+    fprintf(xmf, "<Xdmf Version=\"3.0\" xmlns:xi=\"http://www.w3.org/2003/XInclude\">\n");
+    fprintf(xmf, "  <Domain>\n");
+    fprintf(xmf, "    <Grid Name=\"TimeSeries\" GridType=\"Collection\" CollectionType=\"Temporal\">\n");
+
+    for (int s : steps) {
+        char dir_buf[512];
+        snprintf(dir_buf, 512, base_pattern, s);
+        
+        // Use filesystem to build path correctly (handles all edge cases)
+        namespace fs = std::filesystem;
+        fs::path xmf_path = fs::path(dir_buf) / (std::string(base_filename) + "." + std::to_string(s) + ".xmf");
+        
+        fprintf(xmf, "      <xi:include href=\"%s\" "
+                     "xpointer=\"xpointer(//Xdmf/Domain/Grid)\"/>\n",
+                xmf_path.string().c_str());
+    }
+
+    fprintf(xmf, "    </Grid>\n");
+    fprintf(xmf, "  </Domain>\n");
+    fprintf(xmf, "</Xdmf>\n");
+    fclose(xmf);
+
+    MESSAGE(("XDMF time series written: %s", series_path));
+}
+
+// =============================================================================
+// HDF5 HELPER FUNCTIONS
+// =============================================================================
 
 /**
  * @brief Writes a scalar attribute to an HDF5 object
@@ -1080,6 +1282,30 @@ void vpic_simulation::write_particles_hdf5(const char* fbase,
                      tag, (long)step(), max_total, max_setup, max_meta_create,
                      max_buf_pack, max_compute, max_h5dwrite, max_meta_close));
         }
+        // =====================================================================
+        // XDMF GENERATION (ParaView Support)
+        // =====================================================================
+        if (rank() == 0) {
+            char xmf_path[512];
+            char h5_file[256];
+            
+            // Extract filename without directory path
+            const char* fname_only = strrchr(fbase, '/');
+            fname_only = fname_only ? fname_only + 1 : fbase;
+            
+            if (single_file) {
+                snprintf(xmf_path, 512, "%s.%s.%ld.xmf", fbase, sp->name, (long)step());
+                snprintf(h5_file, 256, "%s.%s.%ld.h5", fname_only, sp->name, (long)step());
+            } else {
+                snprintf(xmf_path, 512, "%s.%s.0.%ld.xmf", fbase, sp->name, (long)step());
+                snprintf(h5_file, 256, "%s.%s.0.%ld.h5", fname_only, sp->name, (long)step());
+            }
+            
+            write_xdmf_particles(xmf_path, h5_file, total_count, sp->g, compute_physical_position);
+            MESSAGE((" Created ParaView file: %s", xmf_path));
+        }
+
+        
 
     } KOKKOS_TOC(write_particles_hdf5, 1);
 }
@@ -1304,7 +1530,7 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
         // PHASE 5: CLEANUP & CLOSE
         // =====================================================================
         
-        t_phase_start = wallclock();
+                t_phase_start = wallclock();
 
         H5Pclose(dxpl);
         H5Sclose(mspace);
@@ -1323,11 +1549,17 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
                max_h5dwrite, max_meta_close, max_total;
         
         mp_allmax_d(&t_setup, &max_setup, 1);
+        
         mp_allmax_d(&t_meta_create, &max_meta_create, 1);
+        
         mp_allmax_d(&t_buf_pack, &max_buf_pack, 1);
+        
         mp_allmax_d(&t_compute, &max_compute, 1);
+        
         mp_allmax_d(&t_h5dwrite, &max_h5dwrite, 1);
+        
         mp_allmax_d(&t_meta_close, &max_meta_close, 1);
+        
         mp_allmax_d(&t_total, &max_total, 1);
 
         if (rank() == 0 && num_active > 0) {
@@ -1350,6 +1582,65 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
                      "BufPack:%.4f,Compute:%.4f,H5Dwrite:%.4f,MetaClose:%.4f",
                      tag, (long)step(), max_total, max_setup, max_meta_create,
                      max_buf_pack, max_compute, max_h5dwrite, max_meta_close));
+        }
+        
+                // =====================================================================
+        // PHASE 6: XDMF GENERATION (ParaView Support)
+        // =====================================================================
+        
+        // **ALL RANKS COMPUTE GRID INFO (MPI COLLECTIVES)**
+        XDMFGridInfo xinfo;
+        if (single_file) {
+            // M2O: Use global grid
+            double local_min[3] = {g->x0, g->y0, g->z0};
+            double local_max[3] = {g->x1, g->y1, g->z1};
+            double global_min[3], global_max[3];
+            
+            mp_allmin_d(local_min, global_min, 3);
+            mp_allmax_d(local_max, global_max, 3);
+            
+            xinfo.dims[0] = (hsize_t)((global_max[2] - global_min[2]) / g->dz + 0.5);
+            xinfo.dims[1] = (hsize_t)((global_max[1] - global_min[1]) / g->dy + 0.5);
+            xinfo.dims[2] = (hsize_t)((global_max[0] - global_min[0]) / g->dx + 0.5);
+            xinfo.origin[0] = global_min[0];
+            xinfo.origin[1] = global_min[1];
+            xinfo.origin[2] = global_min[2];
+        } else {
+            // M2M: Use local grid
+            xinfo.dims[0] = g->nz;
+            xinfo.dims[1] = g->ny;
+            xinfo.dims[2] = g->nx;
+            xinfo.origin[0] = g->x0;
+            xinfo.origin[1] = g->y0;
+            xinfo.origin[2] = g->z0;
+        }
+        xinfo.spacing[0] = g->dx;
+        xinfo.spacing[1] = g->dy;
+        xinfo.spacing[2] = g->dz;
+        
+        // **ONLY RANK 0 WRITES FILE (NO MPI CALLS)**
+        if (rank() == 0) {
+            
+            std::vector<const char*> var_list;
+            for (const auto& v : active_vars) {
+                var_list.push_back(v.name);
+            }
+            
+            char xmf_path[512];
+            char h5_file[256];
+            
+            snprintf(xmf_path, 512, "%s/T.%ld/%s.%ld.xmf",
+                    params.baseDir, (long)step(), params.baseFileName, (long)step());
+            
+            if (single_file) {
+                snprintf(h5_file, 256, "%s.%ld.h5", params.baseFileName, (long)step());
+            } else {
+                snprintf(h5_file, 256, "%s.%ld.0.h5", params.baseFileName, (long)step());
+            }
+
+            write_xdmf_structured(xmf_path, h5_file, var_list, xinfo, g);
+            
+            MESSAGE((" Created ParaView file: %s", xmf_path));
         }
 
     } KOKKOS_TOC(write_fields_hdf5, 1);
@@ -1664,7 +1955,40 @@ void vpic_simulation::write_hydro_hdf5(DumpParameters& params,
                      tag, (long)step(), max_total, max_setup, max_meta_create,
                      max_buf_pack, max_compute, max_h5dwrite, max_meta_close));
         }
+        // Same pattern as fields - compute xinfo with all ranks, then rank 0 writes XDMFGridInfo xinfo;
+        XDMFGridInfo xinfo;
+        if (single_file) {
+            double local_min[3] = {g->x0, g->y0, g->z0};
+            double local_max[3] = {g->x1, g->y1, g->z1};
+            double global_min[3], global_max[3];
+            mp_allmin_d(local_min, global_min, 3);
+            mp_allmax_d(local_max, global_max, 3);
+            xinfo.dims[0] = (hsize_t)((global_max[2] - global_min[2]) / g->dz + 0.5);
+            xinfo.dims[1] = (hsize_t)((global_max[1] - global_min[1]) / g->dy + 0.5);
+            xinfo.dims[2] = (hsize_t)((global_max[0] - global_min[0]) / g->dx + 0.5);
+            xinfo.origin[0] = global_min[0]; xinfo.origin[1] = global_min[1]; xinfo.origin[2] = global_min[2];
+        } else {
+            xinfo.dims[0] = g->nz; xinfo.dims[1] = g->ny; xinfo.dims[2] = g->nx;
+            xinfo.origin[0] = g->x0; xinfo.origin[1] = g->y0; xinfo.origin[2] = g->z0;
+        }
+        xinfo.spacing[0] = g->dx; xinfo.spacing[1] = g->dy; xinfo.spacing[2] = g->dz;
+        
+        if (rank() == 0) {
+            std::vector<const char*> var_list;
+            for (const auto& v : active_vars) var_list.push_back(v.name);
+            
+            char xmf_path[512], h5_file[256];
+            snprintf(xmf_path, 512, "%s/T.%ld/%s.%ld.xmf",
+                    params.baseDir, (long)step(), params.baseFileName, (long)step());
+            snprintf(h5_file, 256, single_file ? "%s.%ld.h5" : "%s.%ld.0.h5",
+                    params.baseFileName, (long)step());
+            
+            write_xdmf_structured(xmf_path, h5_file, var_list, xinfo, g);
+            MESSAGE((" Created ParaView file: %s", xmf_path));
+        }
 
     } KOKKOS_TOC(write_hydro_hdf5, 1);
+
+    
 }
 #endif // VPIC_ENABLE_HDF5

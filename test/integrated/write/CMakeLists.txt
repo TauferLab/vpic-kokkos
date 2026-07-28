@@ -23,97 +23,94 @@ if(NOT Python3_EXECUTABLE)
 endif()
 
 # ==============================================================================
-# SLURM DETECTION & LAUNCHER OVERRIDE
+# MPI LAUNCHER CONFIGURATION
 # ==============================================================================
-# On SLURM systems, raw mpiexec doesn't respect partial node allocations.
-# Use srun (the native SLURM launcher) when available.
+# Universal approach: Use mpirun for tests (works inside/outside allocations).
+# Advanced users can override with: ctest -E . && srun -n 4 ./test_binary
 # ==============================================================================
-
-if(DEFINED ENV{SLURM_JOB_ID})
-  find_program(SRUN_EXECUTABLE srun)
-  
-  if(SRUN_EXECUTABLE)
-    set(MPIEXEC ${SRUN_EXECUTABLE} CACHE FILEPATH "MPI launcher (overridden for SLURM)" FORCE)
-    set(MPIEXEC_NUMPROC_FLAG "-n" CACHE STRING "Flag for number of processes" FORCE)
-    
-    message(STATUS "===============================================")
-    message(STATUS "DETECTED SLURM ENVIRONMENT")
-    message(STATUS "  Job ID:$ENV{SLURM_JOB_ID}")
-    message(STATUS "  Using srun instead of mpiexec for tests")
-    message(STATUS "  MPI Launcher: ${SRUN_EXECUTABLE}")
-    message(STATUS "===============================================")
-  else()
-    message(WARNING "SLURM detected but srun not found in PATH!")
-  endif()
-endif()
 
 # ==============================================================================
 # MPI OVERSUBSCRIPTION DETECTION
 # ==============================================================================
-# Different MPI implementations handle oversubscription differently:
-#   - Open MPI:  Requires explicit --oversubscribe flag
-#   - MPICH:     Enabled by default (no flag needed)
-#   - MVAPICH:   Enabled by default (no flag needed)
-#   - Intel MPI: Generally enabled by default
-#   - Cray MPI:  Uses aprun/srun, handles implicitly
-# ==============================================================================
 
-if(MPI_C_COMPILER)
+# Try multiple methods to find the MPI compiler wrapper
+set(MPI_COMPILER_TO_CHECK "")
+
+if(MPI_CXX_COMPILER)
+  set(MPI_COMPILER_TO_CHECK ${MPI_CXX_COMPILER})
+elseif(MPI_C_COMPILER)
+  set(MPI_COMPILER_TO_CHECK ${MPI_C_COMPILER})
+elseif(CMAKE_CXX_COMPILER MATCHES "mpi")
+  # CMake might have used the MPI wrapper directly
+  set(MPI_COMPILER_TO_CHECK ${CMAKE_CXX_COMPILER})
+endif()
+
+if(MPI_COMPILER_TO_CHECK)
   execute_process(
-    COMMAND ${MPI_C_COMPILER} --version
+    COMMAND ${MPI_COMPILER_TO_CHECK} --version
     OUTPUT_VARIABLE MPI_VERSION_STRING
     ERROR_VARIABLE MPI_VERSION_STRING
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_STRIP_TRAILING_WHITESPACE
   )
   
-  # Check for specific MPI implementations
+  # Detect MPI implementation
   if(MPI_VERSION_STRING MATCHES "Open MPI")
     set(MPI_OVERSUBSCRIBE_FLAG "--oversubscribe")
-    message(STATUS "Detected Open MPI - using ' ${MPI_OVERSUBSCRIBE_FLAG}' flag")
-    
-  elseif(MPI_VERSION_STRING MATCHES "MVAPICH")
-    # MVAPICH/MVAPICH2 allows oversubscription by default
-    set(MPI_OVERSUBSCRIBE_FLAG "")
-    message(STATUS "Detected MVAPICH - oversubscription enabled by default")
-    
-  elseif(MPI_VERSION_STRING MATCHES "MPICH")
-    # MPICH allows oversubscription by default
-    set(MPI_OVERSUBSCRIBE_FLAG "")
-    message(STATUS "Detected MPICH - oversubscription enabled by default")
-    
-  elseif(MPI_VERSION_STRING MATCHES "Intel.*MPI")
-    # Intel MPI typically allows oversubscription by default
-    set(MPI_OVERSUBSCRIBE_FLAG "")
-    message(STATUS "Detected Intel MPI - oversubscription enabled by default")
-    
+    message(STATUS "Detected Open MPI - using '${MPI_OVERSUBSCRIBE_FLAG}' flag")
   else()
-    # Unknown MPI implementation - assume no special flag needed
     set(MPI_OVERSUBSCRIBE_FLAG "")
-    message(STATUS "Unknown MPI implementation - no oversubscription flag (assuming enabled)")
-    message(STATUS "  MPI version string: ${MPI_VERSION_STRING}")
+    message(STATUS "Detected non-OpenMPI - no oversubscription flag needed")
   endif()
-  
 else()
-  # No MPI compiler found
-  set(MPI_OVERSUBSCRIBE_FLAG "")
-  message(WARNING "MPI_C_COMPILER not defined - cannot detect MPI implementation")
+  # Fallback: Check if OpenMPI is in the path
+  execute_process(
+    COMMAND ompi_info --version
+    OUTPUT_VARIABLE OMPI_CHECK
+    ERROR_QUIET
+  )
+  
+  if(OMPI_CHECK MATCHES "Open MPI")
+    set(MPI_OVERSUBSCRIBE_FLAG "--oversubscribe")
+    message(STATUS "Detected Open MPI via ompi_info")
+  else()
+    set(MPI_OVERSUBSCRIBE_FLAG "")
+    message(STATUS "MPI compiler not found - assuming no oversubscription flag needed")
+  endif()
 endif()
+
+# Force mpirun for tests (avoids Slurm PMI configuration hell)
+set(MPIEXEC "mpirun" CACHE STRING "MPI launcher for tests" FORCE)
+set(MPIEXEC_NUMPROC_FLAG "-np" CACHE STRING "Flag for process count" FORCE)
+set(MPIEXEC_PREFLAGS "${MPI_OVERSUBSCRIBE_FLAG}" CACHE STRING "MPI pre-flags" FORCE)
+
+message(STATUS "===============================================")
+message(STATUS "TEST LAUNCHER CONFIGURATION")
+message(STATUS "  Launcher: ${MPIEXEC}")
+message(STATUS "  Proc Flag: ${MPIEXEC_NUMPROC_FLAG}")
+message(STATUS "  Extra Flags: ${MPIEXEC_PREFLAGS}")
+message(STATUS "  Note: Tests use mpirun for cross-environment compatibility")
+message(STATUS "        To use srun, run manually: srun -n 4 --mpi=pmix ./my_test")
+message(STATUS "===============================================")
 
 # ==============================================================================
 # TEST SUBDIRECTORIES
 # ==============================================================================
 
-# Binary tests always run (no external dependencies)
 add_subdirectory(binary)
 
-# HDF5 tests only run if HDF5 support is enabled
 if(VPIC_ENABLE_HDF5)
   add_subdirectory(hdf5)
   message(STATUS "HDF5 I/O tests enabled")
 else()
   message(STATUS "HDF5 I/O tests disabled (VPIC_ENABLE_HDF5=OFF)")
 endif()
+
+message(STATUS "I/O Test Configuration:")
+message(STATUS "  Binary tests:    Enabled")
+message(STATUS "  HDF5 tests:      ${VPIC_ENABLE_HDF5}")
+message(STATUS "  MPI launcher:${MPIEXEC}")
+message(STATUS "  Oversubscribe:   '${MPI_OVERSUBSCRIBE_FLAG}'")
 
 # ==============================================================================
 # SUMMARY

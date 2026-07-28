@@ -298,6 +298,18 @@ public:
                               bool compute_physical_position = false);
 
   #ifdef VPIC_ENABLE_HDF5
+
+  /**
+ * @brief Generates XDMF time series master file using XInclude
+ * @param series_path Output .xmf filename (e.g., "fields_timeseries.xmf")
+ * @param steps Vector of timesteps that were dumped
+ * @param base_pattern Directory structure with %d placeholder (e.g., "fields/T.%d") 
+ * @param base_filename HDF5/XDMF base name (e.g., "fields")
+ */
+void write_xdmf_timeseries(const char* series_path,
+                                            const std::vector<int>& steps,
+                                            const char* base_pattern,
+                                            const char* base_filename);
   // =============================================================================
   // HDF5 WRITE INTERFACE
   // =============================================================================
