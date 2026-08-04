@@ -552,7 +552,7 @@ void vpic_simulation::write_particles_binary(const char* fbase,
     } TOC(write_particles_bin, 1);
 }
 
-#ifdef VPIC_ENABLE_HDF5
+#if defined(VPIC_ENABLE_HDF5) && !defined(VPIC_HDF5_SERIAL_ONLY)
 
 // =============================================================================
 // XDMF GENERATION HELPER
@@ -630,7 +630,6 @@ struct XDMFGridInfo {
     double spacing[3];    // Cell size [dz, dy, dz]
 };
 
-// Replace entire function starting at line ~78
 /**
  * @brief Generates XDMF wrapper for HDF5 structured grid data (fields/hydro)
  * @param xmf_path Output .xmf filename
@@ -1991,4 +1990,916 @@ void vpic_simulation::write_hydro_hdf5(DumpParameters& params,
 
     
 }
-#endif // VPIC_ENABLE_HDF5
+// =============================================================================
+// HDF5 IMPLEMENTATIONS - SERIAL HDF5 ONLY (FPP MODE ONLY)
+// =============================================================================
+
+#elif defined(VPIC_ENABLE_HDF5) && defined(VPIC_HDF5_SERIAL_ONLY)
+
+// This section compiles when HDF5 is available but only in serial mode
+// Provides FPP (File-Per-Process) mode ONLY - no collective I/O
+
+struct XDMFGridInfo {
+    hsize_t dims[3];
+    double origin[3];
+    double spacing[3];
+};
+
+/**
+ * @brief Generates XDMF wrapper for HDF5 structured grid data (fields/hydro)
+ * @param xmf_path Output .xmf filename
+ * @param h5_filename Relative path to HDF5 file (from .xmf location)
+ * @param var_names List of dataset names in HDF5 file
+ * @param xinfo Pre-computed grid info (NO MPI CALLS INSIDE THIS FUNCTION)
+ * @param g Grid structure for time metadata only
+ */
+static void write_xdmf_structured(const char* xmf_path,
+                                  const char* h5_filename,
+                                  const std::vector<const char*>& var_names,
+                                  const XDMFGridInfo& xinfo,
+                                  grid_t* g) {
+    FILE* xmf = fopen(xmf_path, "w");
+    if (!xmf) ERROR(("Failed to create XDMF file: %s", xmf_path));
+
+    // Write XDMF header
+    fprintf(xmf, "<?xml version=\"1.0\" ?>\n");
+    fprintf(xmf, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n");
+    fprintf(xmf, "<Xdmf Version=\"3.0\">\n");
+    fprintf(xmf, "  <Domain>\n");
+    fprintf(xmf, "    <Grid Name=\"VPIC\" GridType=\"Uniform\">\n");
+    
+    // Topology: 3D structured grid (IJK ordering)
+    fprintf(xmf, "      <Topology TopologyType=\"3DCoRectMesh\" "
+                 "Dimensions=\"%llu %llu %llu\"/>\n",
+            (unsigned long long)(xinfo.dims[0]+1), 
+            (unsigned long long)(xinfo.dims[1]+1), 
+            (unsigned long long)(xinfo.dims[2]+1));
+    
+    // Geometry: Uniform spacing with origin
+    fprintf(xmf, "      <Geometry GeometryType=\"ORIGIN_DXDYDZ\">\n");
+    fprintf(xmf, "        <DataItem Dimensions=\"3\" NumberType=\"Float\" "
+                 "Precision=\"8\" Format=\"XML\">%g %g %g</DataItem>\n",
+            xinfo.origin[2], xinfo.origin[1], xinfo.origin[0]);  // Z, Y, X order
+    fprintf(xmf, "        <DataItem Dimensions=\"3\" NumberType=\"Float\" "
+                 "Precision=\"8\" Format=\"XML\">%g %g %g</DataItem>\n",
+            xinfo.spacing[2], xinfo.spacing[1], xinfo.spacing[0]);
+    fprintf(xmf, "      </Geometry>\n");
+    
+    // Attributes: Each variable as a scalar field
+    for (const char* var_name : var_names) {
+        fprintf(xmf, "      <Attribute Name=\"%s\" AttributeType=\"Scalar\" "
+                     "Center=\"Cell\">\n", var_name);
+        fprintf(xmf, "        <DataItem Dimensions=\"%llu %llu %llu\" "
+                     "NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n",
+                (unsigned long long)xinfo.dims[0], 
+                (unsigned long long)xinfo.dims[1], 
+                (unsigned long long)xinfo.dims[2]);
+        fprintf(xmf, "          %s:/%s\n", h5_filename, var_name);
+        fprintf(xmf, "        </DataItem>\n");
+        fprintf(xmf, "      </Attribute>\n");
+    }
+    
+    // Add time attribute
+    fprintf(xmf, "      <Time Value=\"%g\"/>\n", g->t0 + g->dt * g->step);
+    
+    fprintf(xmf, "    </Grid>\n");
+    fprintf(xmf, "  </Domain>\n");
+    fprintf(xmf, "</Xdmf>\n");
+    
+    fclose(xmf);
+}
+
+/**
+ * @brief Generates XDMF wrapper for HDF5 particle data (unstructured point cloud)
+ * @param xmf_path Output .xmf filename
+ * @param h5_filename Relative path to HDF5 file
+ * @param particle_count Total number of particles
+ * @param g Grid structure (for time metadata)
+ * @param has_position True if file contains (x,y,z), false if (dx,dy,dz,i)
+ */
+static void write_xdmf_particles(const char* xmf_path,
+                                 const char* h5_filename,
+                                 hsize_t particle_count,
+                                 grid_t* g,
+                                 bool has_position) {
+    FILE* xmf = fopen(xmf_path, "w");
+    if (!xmf) ERROR(("Failed to create XDMF file: %s", xmf_path));
+
+    fprintf(xmf, "<?xml version=\"1.0\" ?>\n");
+    fprintf(xmf, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n");
+    fprintf(xmf, "<Xdmf Version=\"3.0\">\n");
+    fprintf(xmf, "  <Domain>\n");
+    fprintf(xmf, "    <Grid Name=\"Particles\" GridType=\"Uniform\">\n");
+    
+    // Topology: Unstructured point cloud
+    fprintf(xmf, "      <Topology TopologyType=\"Polyvertex\" "
+                 "NumberOfElements=\"%llu\"/>\n", (unsigned long long)particle_count);
+    
+    // Geometry: XYZ positions
+    if (has_position) {
+        // Physical mode: positions are (x, y, z) fields in compound dataset
+        fprintf(xmf, "      <Geometry GeometryType=\"XYZ\">\n");
+        fprintf(xmf, "        <DataItem Dimensions=\"%llu 3\" NumberType=\"Float\" "
+                     "Precision=\"4\" Format=\"HDF\">\n", (unsigned long long)particle_count);
+        fprintf(xmf, "          %s:/particles\n", h5_filename);
+        fprintf(xmf, "        </DataItem>\n");
+        fprintf(xmf, "      </Geometry>\n");
+        
+        // Attributes: Velocity components
+        for (const char* comp : {"ux", "uy", "uz", "w"}) {
+            fprintf(xmf, "      <Attribute Name=\"%s\" AttributeType=\"Scalar\" "
+                         "Center=\"Node\">\n", comp);
+            fprintf(xmf, "        <DataItem ItemType=\"HyperSlab\" Dimensions=\"%llu 1\">\n",
+                    (unsigned long long)particle_count);
+            fprintf(xmf, "          <DataItem Dimensions=\"3 2\" NumberType=\"UInt\" "
+                         "Format=\"XML\">0 %d 1 1 %llu 1</DataItem>\n",
+                    (strcmp(comp, "ux") == 0) ? 3 : 
+                    (strcmp(comp, "uy") == 0) ? 4 :
+                    (strcmp(comp, "uz") == 0) ? 5 : 6,
+                    (unsigned long long)particle_count);
+            fprintf(xmf, "          <DataItem Dimensions=\"%llu 7\" NumberType=\"Float\" "
+                         "Precision=\"4\" Format=\"HDF\">%s:/particles</DataItem>\n",
+                    (unsigned long long)particle_count, h5_filename);
+            fprintf(xmf, "        </DataItem>\n");
+            fprintf(xmf, "      </Attribute>\n");
+        }
+    } else {
+        // Logical mode: Need to warn user or skip geometry
+        fprintf(xmf, "      <!-- Warning: Logical coordinates (dx,dy,dz,i) cannot be "
+                     "directly visualized in ParaView -->\n");
+        fprintf(xmf, "      <!-- Recommend re-running with compute_physical_position=true -->\n");
+        fprintf(xmf, "      <Geometry GeometryType=\"XYZ\">\n");
+        fprintf(xmf, "        <DataItem Dimensions=\"%llu 3\" NumberType=\"Float\" "
+                     "Precision=\"4\" Format=\"XML\">\n", (unsigned long long)particle_count);
+        fprintf(xmf, "          0 0 0  <!-- Placeholder: actual positions unavailable -->\n");
+        fprintf(xmf, "        </DataItem>\n");
+        fprintf(xmf, "      </Geometry>\n");
+    }
+    
+    fprintf(xmf, "      <Time Value=\"%g\"/>\n", g->t0 + g->dt * g->step);
+    fprintf(xmf, "    </Grid>\n");
+    fprintf(xmf, "  </Domain>\n");
+    fprintf(xmf, "</Xdmf>\n");
+    
+    fclose(xmf);
+}
+
+/**
+ * @brief Generates XDMF time series master file using XInclude
+ * @param series_path Output .xmf filename (e.g., "fields_timeseries.xmf")
+ * @param steps Vector of timesteps that were dumped
+ * @param base_pattern Directory structure with %d placeholder (e.g., "fields/T.%d") 
+ * @param base_filename HDF5/XDMF base name (e.g., "fields")
+ */
+#include <filesystem>  // Add to vpic.h or dump.cc
+
+void vpic_simulation::write_xdmf_timeseries(const char* series_path,
+                                            const std::vector<int>& steps,
+                                            const char* base_pattern,
+                                            const char* base_filename) {
+    if (rank() != 0) return;
+    MESSAGE(("WARNING: write_xdmf_timeseries() with serial HDF5 creates per-rank files. "
+            "ParaView visualization may require additional configuration."));
+
+    FILE* xmf = fopen(series_path, "w");
+    if (!xmf) {
+        MESSAGE(("WARNING: Could not create XDMF time series: %s", series_path));
+        return;
+    }
+
+    fprintf(xmf, "<?xml version=\"1.0\" ?>\n");
+    fprintf(xmf, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n");
+    fprintf(xmf, "<Xdmf Version=\"3.0\" xmlns:xi=\"http://www.w3.org/2003/XInclude\">\n");
+    fprintf(xmf, "  <Domain>\n");
+    fprintf(xmf, "    <Grid Name=\"TimeSeries\" GridType=\"Collection\" CollectionType=\"Temporal\">\n");
+
+    for (int s : steps) {
+        char dir_buf[512];
+        snprintf(dir_buf, 512, base_pattern, s);
+        
+        // Use filesystem to build path correctly (handles all edge cases)
+        namespace fs = std::filesystem;
+        fs::path xmf_path = fs::path(dir_buf) / (std::string(base_filename) + "." + std::to_string(s) + ".xmf");
+        
+        fprintf(xmf, "      <xi:include href=\"%s\" "
+                     "xpointer=\"xpointer(//Xdmf/Domain/Grid)\"/>\n",
+                xmf_path.string().c_str());
+    }
+
+    fprintf(xmf, "    </Grid>\n");
+    fprintf(xmf, "  </Domain>\n");
+    fprintf(xmf, "</Xdmf>\n");
+    fclose(xmf);
+
+    MESSAGE(("XDMF time series written: %s", series_path));
+}
+
+template<typename T>
+static void write_scalar_attr(hid_t loc_id, const char* name, hid_t type_id, T value) {
+    hid_t space = H5Screate(H5S_SCALAR);
+    hid_t attr = H5Acreate2(loc_id, name, type_id, space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr, type_id, &value);
+    H5Aclose(attr);
+    H5Sclose(space);
+}
+
+// Simplified FAPL creation - no parallel I/O options
+static hid_t create_serial_fapl() {
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    
+    // Basic optimizations (no MPI-specific options)
+    H5Pset_alignment(fapl, 4096, 16 * 1024 * 1024);
+    
+    H5AC_cache_config_t cache_config;
+    cache_config.version = H5AC__CURR_CACHE_CONFIG_VERSION;
+    H5Pget_mdc_config(fapl, &cache_config);
+    cache_config.evictions_enabled = 0;
+    cache_config.incr_mode = H5C_incr__off;
+    cache_config.flash_incr_mode = H5C_flash_incr__off;
+    cache_config.decr_mode = H5C_decr__off;
+    H5Pset_mdc_config(fapl, &cache_config);
+    
+    return fapl;
+}
+
+// Serial HDF5 write functions - FPP mode only, single_file parameter ignored
+void vpic_simulation::write_particles_hdf5(const char* fbase, 
+                                           const char* species_name, 
+                                           bool single_file,
+                                           bool compute_physical_position) {
+    KOKKOS_TIC() {
+        if (single_file && rank() == 0) {
+            MESSAGE(("WARNING: write_particles_hdf5() called with single_file=true"));
+            MESSAGE(("This build uses serial HDF5 (VPIC_HDF_SERIAL_ONLY=ON)"));
+            MESSAGE(("Forcing File-Per-Process mode - each rank writes separate file"));
+        }
+        
+        // Force FPP mode
+        single_file = false;
+        
+        const bool TIME_PURE_IO_ONLY = true;
+        double t_total_start = wallclock();
+        double t_setup = 0.0, t_meta_create = 0.0, t_buf_pack = 0.0;
+        double t_compute = 0.0, t_h5dwrite = 0.0, t_meta_close = 0.0;
+
+        double t_phase_start = wallclock();
+        species_t* sp = find_species(species_name);
+        if(!sp) ERROR(("Invalid species: %s", species_name));
+        sp->copy_to_host();
+        grid_t* g = sp->g;
+
+        hsize_t my_count = sp->np;
+        t_setup = wallclock() - t_phase_start;
+
+        // File creation - per-rank file only
+        t_phase_start = wallclock();
+        char fname[256];
+        snprintf(fname, 256, "%s.%s.%d.%ld.h5", fbase, sp->name, rank(), (long)step());
+
+        hid_t fapl = create_serial_fapl();
+        hid_t fid = H5Fcreate(fname, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+        H5Pclose(fapl);
+        if(fid < 0) ERROR(("Failed HDF5 create: %s", fname));
+
+        // Compound type definition
+        hid_t ptype;
+        size_t particle_size;
+        
+        if (compute_physical_position) {
+            particle_size = 7 * sizeof(float);
+            ptype = H5Tcreate(H5T_COMPOUND, particle_size);
+            H5Tinsert(ptype, "x",  0*sizeof(float), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "y",  1*sizeof(float), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "z",  2*sizeof(float), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "ux", 3*sizeof(float), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "uy", 4*sizeof(float), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "uz", 5*sizeof(float), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "w",  6*sizeof(float), H5T_NATIVE_FLOAT);
+        } else {
+            particle_size = sizeof(particle_t);
+            ptype = H5Tcreate(H5T_COMPOUND, particle_size);
+            H5Tinsert(ptype, "dx", offsetof(particle_t, dx), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "dy", offsetof(particle_t, dy), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "dz", offsetof(particle_t, dz), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "i",  offsetof(particle_t, i),  H5T_NATIVE_INT32);
+            H5Tinsert(ptype, "ux", offsetof(particle_t, ux), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "uy", offsetof(particle_t, uy), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "uz", offsetof(particle_t, uz), H5T_NATIVE_FLOAT);
+            H5Tinsert(ptype, "w",  offsetof(particle_t, w),  H5T_NATIVE_FLOAT);
+        }
+
+        hid_t fspace = H5Screate_simple(1, &my_count, NULL);
+        hid_t dset_particles = H5Dcreate2(fid, "particles", ptype, fspace,
+                                         H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+        // No collective I/O setup needed - serial only
+        hid_t dxpl = H5P_DEFAULT;
+        t_meta_create = wallclock() - t_phase_start;
+
+        // Chunked particle processing (same as parallel version)
+        const int PBUF_SIZE = 2097152;
+        particle_t* p_buf;
+        MALLOC_ALIGNED(p_buf, PBUF_SIZE, 128);
+
+        float* output_buf = nullptr;
+        if (compute_physical_position) {
+            MALLOC_ALIGNED(output_buf, PBUF_SIZE * 7, 128);
+        }
+
+        auto& k_p_h = sp->k_p_h;
+        auto& k_p_i_h = sp->k_p_i_h;
+        int sp_np = sp->np;
+        int sp_max_np = sp->max_np;
+
+        int nx = g->nx, ny = g->ny, nz = g->nz;
+        float dx = g->dx, dy = g->dy, dz = g->dz;
+        float x0 = g->x0, y0 = g->y0, z0 = g->z0;
+
+        hsize_t current_file_offset = 0;
+        int total_loops = (sp_np + PBUF_SIZE - 1) / PBUF_SIZE;
+
+        for(int loop_idx = 0; loop_idx < total_loops; ++loop_idx) {
+            int buf_start = loop_idx * PBUF_SIZE;
+            hsize_t chunk_valid_count = 0;
+
+            if (buf_start < sp_np) {
+                sp->np = sp_np - buf_start;
+                if(sp->np > PBUF_SIZE) sp->np = PBUF_SIZE;
+                sp->max_np = PBUF_SIZE;
+
+                double t_loop_start = wallclock();
+                
+                Kokkos::View<particle_t*, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+                    pbuf_view(p_buf, PBUF_SIZE);
+                
+                Kokkos::parallel_for("PopulateParticleDumpBuffer",
+                    Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, sp->np),
+                    KOKKOS_LAMBDA(int i) {
+                        int idx = buf_start + i;
+                        pbuf_view(i).dx = k_p_h(idx, particle_var::dx);
+                        pbuf_view(i).dy = k_p_h(idx, particle_var::dy);
+                        pbuf_view(i).dz = k_p_h(idx, particle_var::dz);
+                        pbuf_view(i).ux = k_p_h(idx, particle_var::ux);
+                        pbuf_view(i).uy = k_p_h(idx, particle_var::uy);
+                        pbuf_view(i).uz = k_p_h(idx, particle_var::uz);
+                        pbuf_view(i).w  = k_p_h(idx, particle_var::w);
+                        pbuf_view(i).i  = k_p_i_h(idx);
+                    });
+                Kokkos::fence();
+                
+                t_buf_pack += (wallclock() - t_loop_start);
+
+                t_loop_start = wallclock();
+                center_p_dump(sp, p_buf, interpolator_array);
+                chunk_valid_count = sp->np;
+                t_compute += (wallclock() - t_loop_start);
+
+                if (compute_physical_position && chunk_valid_count > 0) {
+                    float* out = (float*)output_buf;
+                    for(hsize_t n = 0; n < chunk_valid_count; ++n) {
+                        int voxel_idx = p_buf[n].i;
+                        int ix, iy, iz;
+                        UNVOXEL(voxel_idx, ix, iy, iz, nx, ny, nz);
+                        
+                        out[n*7 + 0] = x0 + (ix - 1 + 0.5f * (1.0f + p_buf[n].dx)) * dx;
+                        out[n*7 + 1] = y0 + (iy - 1 + 0.5f * (1.0f + p_buf[n].dy)) * dy;
+                        out[n*7 + 2] = z0 + (iz - 1 + 0.5f * (1.0f + p_buf[n].dz)) * dz;
+                        out[n*7 + 3] = p_buf[n].ux;
+                        out[n*7 + 4] = p_buf[n].uy;
+                        out[n*7 + 5] = p_buf[n].uz;
+                        out[n*7 + 6] = p_buf[n].w;
+                    }
+                }
+            }
+
+            if (chunk_valid_count > 0) {
+                double t_loop_start = wallclock();
+                
+                hid_t mspace = H5Screate_simple(1, &chunk_valid_count, NULL);
+                H5Sselect_hyperslab(fspace, H5S_SELECT_SET,
+                                   &current_file_offset, NULL,
+                                   &chunk_valid_count, NULL);
+                
+                void* write_ptr = compute_physical_position ? (void*)output_buf : (void*)p_buf;
+                H5Dwrite(dset_particles, ptype, mspace, fspace, dxpl, write_ptr);
+                
+                H5Sclose(mspace);
+                current_file_offset += chunk_valid_count;
+                t_h5dwrite += (wallclock() - t_loop_start);
+            }
+        }
+
+        sp->np = sp_np;
+        sp->max_np = sp_max_np;
+        FREE_ALIGNED(p_buf);
+        if (output_buf) FREE_ALIGNED(output_buf);
+
+        t_phase_start = wallclock();
+        H5Dclose(dset_particles);
+        H5Tclose(ptype);
+        H5Sclose(fspace);
+        H5Fclose(fid);
+        t_meta_close = wallclock() - t_phase_start;
+        
+        double t_total = wallclock() - t_total_start;
+
+        // Metrics
+        double max_setup, max_meta_create, max_buf_pack, max_compute,
+               max_h5dwrite, max_meta_close, max_total;
+        
+        mp_allmax_d(&t_setup, &max_setup, 1);
+        mp_allmax_d(&t_meta_create, &max_meta_create, 1);
+        mp_allmax_d(&t_buf_pack, &max_buf_pack, 1);
+        mp_allmax_d(&t_compute, &max_compute, 1);
+        mp_allmax_d(&t_h5dwrite, &max_h5dwrite, 1);
+        mp_allmax_d(&t_meta_close, &max_meta_close, 1);
+        mp_allmax_d(&t_total, &max_total, 1);
+        
+        double mb_local = (double)(my_count * particle_size) / (1024.0 * 1024.0);
+        double mb_total = 0.0;
+        mp_allsum_d(&mb_local, &mb_total, 1);
+
+        if (rank() == 0) {
+            double t_metric = TIME_PURE_IO_ONLY ? max_h5dwrite : max_total;
+            double throughput = mb_total / t_metric;
+            
+            const char* pos_mode = compute_physical_position ? "physical" : "logical";
+            char tag[64];
+            snprintf(tag, 64, "write_particles_hdf5_M2M_%s_serial", pos_mode);
+            
+            MESSAGE(("[METRIC],%s,%ld,%.4f,%.4f,%.4f",
+                     tag, (long)step(), t_metric, mb_total, throughput));
+            
+            MESSAGE(("[DIAGNOSTIC],%s,%ld,Total:%.4f,Setup:%.4f,MetaCreate:%.4f,"
+                     "BufPack:%.4f,Compute:%.4f,H5Dwrite:%.4f,MetaClose:%.4f",
+                     tag, (long)step(), max_total, max_setup, max_meta_create,
+                     max_buf_pack, max_compute, max_h5dwrite, max_meta_close));
+        }
+
+        // XDMF generation
+        if (rank() == 0) {
+            char xmf_path[512];
+            char h5_file[256];
+            
+            const char* fname_only = strrchr(fbase, '/');
+            fname_only = fname_only ? fname_only + 1 : fbase;
+            
+            snprintf(xmf_path, 512, "%s.%s.0.%ld.xmf", fbase, sp->name, (long)step());
+            snprintf(h5_file, 256, "%s.%s.0.%ld.h5", fname_only, sp->name, (long)step());
+            
+            write_xdmf_particles(xmf_path, h5_file, my_count, sp->g, compute_physical_position);
+            MESSAGE((" Created ParaView file: %s (serial HDF5, per-rank files)", xmf_path));
+        }
+
+    } KOKKOS_TOC(write_particles_hdf5, 1);
+}
+
+void vpic_simulation::write_fields_hdf5(DumpParameters& params, 
+                                        field_array_t* fa, 
+                                        bool single_file) {
+    KOKKOS_TIC() {
+        if (single_file && rank() == 0) {
+            MESSAGE(("WARNING: write_fields_hdf5() called with single_file=true"));
+            MESSAGE(("This build uses serial HDF5 (VPIC_HDF_SERIAL_ONLY=ON)"));
+            MESSAGE(("Forcing File-Per-Process mode - each rank writes separate file"));
+        }
+        
+        single_file = false;
+        
+        const bool TIME_PURE_IO_ONLY = true;
+        double t_total_start = wallclock();
+        double t_setup = 0.0, t_meta_create = 0.0, t_buf_pack = 0.0;
+        double t_compute = 0.0, t_h5dwrite = 0.0, t_meta_close = 0.0;
+
+        double t_phase_start = wallclock();
+
+        if (!fa) ERROR(("NULL field array"));
+        if (step() > fa->last_copied) fa->copy_to_host();
+        grid_t* g = fa->g;
+
+        if (rank() == 0) { 
+            ensure_directory(params.baseDir);
+            char time_dir[256];
+            snprintf(time_dir, 256, "%s/T.%ld", params.baseDir, (long)step());
+            ensure_directory(time_dir);
+        }
+        mp_barrier();
+
+        struct FieldMap { 
+            int bit;
+            const char* name;
+            int offset;
+        };
+        
+        static const std::vector<FieldMap> field_map = {
+            {0, "ex",         offsetof(field_t, ex)},
+            {1, "ey",         offsetof(field_t, ey)},
+            {2, "ez",         offsetof(field_t, ez)},
+            {3, "div_e_err",  offsetof(field_t, div_e_err)},
+            {4, "cbx",        offsetof(field_t, cbx)},
+            {5, "cby",        offsetof(field_t, cby)},
+            {6, "cbz",        offsetof(field_t, cbz)},
+            {7, "div_b_err",  offsetof(field_t, div_b_err)}
+        };
+        
+        struct ActiveVar { 
+            const char* name; 
+            int offset; 
+        };
+        std::vector<ActiveVar> active_vars;
+        
+        for (const auto& m : field_map) {
+            if (params.output_vars.bitset(m.bit)) {
+                active_vars.push_back({m.name, m.offset});
+            }
+        }
+        int num_active = active_vars.size();
+
+        t_setup = wallclock() - t_phase_start;
+
+        t_phase_start = wallclock();
+
+        char fname[256];
+        snprintf(fname, 256, "%s/T.%ld/%s.%ld.%d.h5",
+                 params.baseDir, (long)step(), params.baseFileName, (long)step(), rank());
+
+        hsize_t local_dims[3] = {(hsize_t)g->nz, (hsize_t)g->ny, (hsize_t)g->nx};
+
+        hid_t fapl_id = create_serial_fapl();
+        hid_t fid = H5Fcreate(fname, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id);
+        H5Pclose(fapl_id);
+        if (fid < 0) ERROR(("Failed to create HDF5 file: %s", fname));
+
+        hid_t dspace = H5Screate_simple(3, local_dims, NULL);
+        hid_t mspace = H5Screate_simple(3, local_dims, NULL);
+
+        write_scalar_attr(fid, "step", H5T_NATIVE_LONG, (long)g->step);
+        write_scalar_attr(fid, "time", H5T_NATIVE_DOUBLE, (double)g->t0);
+
+        hid_t dxpl = H5P_DEFAULT;
+        t_meta_create = wallclock() - t_phase_start;
+
+        size_t num_cells = g->nx * g->ny * g->nz;
+        
+        static Kokkos::View<float**, Kokkos::HostSpace> buffer("h5_field_buf", 8, 0);
+        if (buffer.extent(1) < num_cells) {
+            Kokkos::resize(buffer, 8, num_cells);
+        }
+
+        t_phase_start = wallclock();
+
+        auto* f_base = fa->f;
+        int nx = g->nx, ny = g->ny, nz = g->nz;
+        
+        using Policy3D = Kokkos::MDRangePolicy<Kokkos::DefaultHostExecutionSpace, 
+                                               Kokkos::Rank<3>>;
+        
+        Kokkos::parallel_for("PackFieldsSinglePass", 
+            Policy3D({1, 1, 1}, {nz+1, ny+1, nx+1}),
+            [&](int k, int j, int i) {
+                size_t buf_idx = ((k-1) * ny * nx) + ((j-1) * nx) + (i-1);
+                char* cell_base = (char*)&f_base[voxel(i, j, k)];
+                
+                for (int v = 0; v < num_active; ++v) {
+                    buffer(v, buf_idx) = *(float*)(cell_base + active_vars[v].offset);
+                }
+            });
+        Kokkos::fence();
+
+        t_buf_pack = wallclock() - t_phase_start;
+        t_compute = 0.0;
+
+        t_phase_start = wallclock();
+
+        for (int v = 0; v < num_active; ++v) {
+            hid_t dset = H5Dcreate2(fid, active_vars[v].name, H5T_NATIVE_FLOAT, 
+                                   dspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            
+            H5Dwrite(dset, H5T_NATIVE_FLOAT, mspace, dspace, dxpl, &buffer(v, 0));
+            H5Dclose(dset);
+        }
+
+        t_h5dwrite = wallclock() - t_phase_start;
+
+        t_phase_start = wallclock();
+        H5Sclose(mspace);
+        H5Sclose(dspace);
+        H5Fclose(fid);
+        t_meta_close = wallclock() - t_phase_start;
+        
+        double t_total = wallclock() - t_total_start;
+
+        double max_setup, max_meta_create, max_buf_pack, max_compute,
+               max_h5dwrite, max_meta_close, max_total;
+        
+        mp_allmax_d(&t_setup, &max_setup, 1);
+        mp_allmax_d(&t_meta_create, &max_meta_create, 1);
+        mp_allmax_d(&t_buf_pack, &max_buf_pack, 1);
+        mp_allmax_d(&t_compute, &max_compute, 1);
+        mp_allmax_d(&t_h5dwrite, &max_h5dwrite, 1);
+        mp_allmax_d(&t_meta_close, &max_meta_close, 1);
+        mp_allmax_d(&t_total, &max_total, 1);
+
+        if (rank() == 0 && num_active > 0) {
+            double mb_total = ((double)(num_cells * num_active * sizeof(float)) / 
+                              (1024.0 * 1024.0)) * nproc();
+            
+            double t_metric = TIME_PURE_IO_ONLY ? max_h5dwrite : max_total;
+            double throughput = mb_total / t_metric;
+            
+            const char* tag = "write_fields_hdf5_M2M_serial";
+            
+            MESSAGE(("[METRIC],%s,%ld,%.4f,%.4f,%.4f", 
+                     tag, (long)step(), t_metric, mb_total, throughput));
+            
+            MESSAGE(("[DIAGNOSTIC],%s,%ld,Total:%.4f,Setup:%.4f,MetaCreate:%.4f,"
+                     "BufPack:%.4f,Compute:%.4f,H5Dwrite:%.4f,MetaClose:%.4f",
+                     tag, (long)step(), max_total, max_setup, max_meta_create,
+                     max_buf_pack, max_compute, max_h5dwrite, max_meta_close));
+        }
+        
+        // XDMF generation
+        XDMFGridInfo xinfo;
+        xinfo.dims[0] = g->nz; 
+        xinfo.dims[1] = g->ny; 
+        xinfo.dims[2] = g->nx;
+        xinfo.origin[0] = g->x0; 
+        xinfo.origin[1] = g->y0; 
+        xinfo.origin[2] = g->z0;
+        xinfo.spacing[0] = g->dx; 
+        xinfo.spacing[1] = g->dy; 
+        xinfo.spacing[2] = g->dz;
+        
+        if (rank() == 0) {
+            std::vector<const char*> var_list;
+            for (const auto& v : active_vars) var_list.push_back(v.name);
+            
+            char xmf_path[512], h5_file[256];
+            snprintf(xmf_path, 512, "%s/T.%ld/%s.%ld.xmf",
+                    params.baseDir, (long)step(), params.baseFileName, (long)step());
+            snprintf(h5_file, 256, "%s.%ld.0.h5", params.baseFileName, (long)step());
+            
+            write_xdmf_structured(xmf_path, h5_file, var_list, xinfo, g);
+            MESSAGE((" Created ParaView file: %s (serial HDF5, per-rank files)", xmf_path));
+        }
+
+    } KOKKOS_TOC(write_fields_hdf5, 1);
+}
+
+void vpic_simulation::write_hydro_hdf5(DumpParameters& params, 
+                                       hydro_array_t* ha, 
+                                       const char* sp_name, 
+                                       bool single_file) {
+    KOKKOS_TIC() {
+        if (single_file && rank() == 0) {
+            MESSAGE(("WARNING: write_hydro_hdf5() called with single_file=true"));
+            MESSAGE(("This build uses serial HDF5 (VPIC_HDF_SERIAL_ONLY=ON)"));
+            MESSAGE(("Forcing File-Per-Process mode - each rank writes separate file"));
+        }
+        
+        single_file = false;
+        
+        const bool TIME_PURE_IO_ONLY = true;
+        double t_total_start = wallclock();
+        double t_setup = 0.0, t_meta_create = 0.0, t_buf_pack = 0.0;
+        double t_compute = 0.0, t_h5dwrite = 0.0, t_meta_close = 0.0;
+
+        double t_phase_start = wallclock();
+
+        if (!ha) ERROR(("NULL hydro array"));
+        
+        species_t* sp = find_species(sp_name);
+        if (!sp) ERROR(("Invalid species: %s", sp_name));
+
+        Kokkos::deep_copy(hydro_array->k_h_d, 0.0f);
+        clear_hydro_array(ha);
+        accumulate_hydro_p_kokkos(sp->k_p_d, sp->k_p_i_d, hydro_array->k_h_d, 
+                                 interpolator_array->k_i_d, sp);
+        ha->copy_to_host();
+        synchronize_hydro_array(ha);
+        
+        grid_t* g = ha->g;
+
+        if (rank() == 0) {
+            ensure_directory(params.baseDir);
+            char time_dir[256];
+            snprintf(time_dir, 256, "%s/T.%ld", params.baseDir, (long)step());
+            ensure_directory(time_dir);
+        }
+        mp_barrier();
+
+        struct HydroMap {
+            int bit;
+            const char* name;
+            int offset;
+        };
+        
+        static const std::vector<HydroMap> hydro_map = {
+            {0,  "jx",  offsetof(hydro_t, jx)},
+            {1,  "jy",  offsetof(hydro_t, jy)},
+            {2,  "jz",  offsetof(hydro_t, jz)},
+            {3,  "rho", offsetof(hydro_t, rho)},
+            {4,  "px",  offsetof(hydro_t, px)},
+            {5,  "py",  offsetof(hydro_t, py)},
+            {6,  "pz",  offsetof(hydro_t, pz)},
+            {7,  "ke",  offsetof(hydro_t, ke)},
+            {8,  "txx", offsetof(hydro_t, txx)},
+            {9,  "tyy", offsetof(hydro_t, tyy)},
+            {10, "tzz", offsetof(hydro_t, tzz)},
+            {11, "tyz", offsetof(hydro_t, tyz)},
+            {12, "tzx", offsetof(hydro_t, tzx)},
+            {13, "txy", offsetof(hydro_t, txy)}
+        };
+        
+        struct ActiveVar {
+            const char* name;
+            int offset;
+        };
+        std::vector<ActiveVar> active_vars;
+        
+        for (const auto& m : hydro_map) {
+            if (params.output_vars.bitset(m.bit)) {
+                active_vars.push_back({m.name, m.offset});
+            }
+        }
+        int num_active = active_vars.size();
+
+        t_setup = wallclock() - t_phase_start;
+
+        t_phase_start = wallclock();
+
+        char fname[256];
+        snprintf(fname, 256, "%s/T.%ld/%s.%ld.%d.h5",
+                 params.baseDir, (long)step(), params.baseFileName, (long)step(), rank());
+
+        hsize_t local_dims[3] = {(hsize_t)g->nz, (hsize_t)g->ny, (hsize_t)g->nx};
+
+        hid_t fapl_id = create_serial_fapl();
+        hid_t fid = H5Fcreate(fname, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id);
+        H5Pclose(fapl_id);
+        if (fid < 0) ERROR(("Failed to create HDF5 file: %s", fname));
+
+        hid_t dspace = H5Screate_simple(3, local_dims, NULL);
+        hid_t mspace = H5Screate_simple(3, local_dims, NULL);
+
+        write_scalar_attr(fid, "step", H5T_NATIVE_LONG, (long)g->step);
+        write_scalar_attr(fid, "time", H5T_NATIVE_DOUBLE, (double)g->t0);
+
+        hid_t dxpl = H5P_DEFAULT;
+        t_meta_create = wallclock() - t_phase_start;
+
+        size_t num_cells = g->nx * g->ny * g->nz;
+        
+        static Kokkos::View<float**, Kokkos::HostSpace> buffer("h5_hydro_buf", 14, 0);
+        if (buffer.extent(1) < num_cells) {
+            Kokkos::resize(buffer, 14, num_cells);
+        }
+
+        t_phase_start = wallclock();
+
+        auto* h_base = ha->h;
+        int nx = g->nx, ny = g->ny, nz = g->nz;
+        
+        using Policy3D = Kokkos::MDRangePolicy<Kokkos::DefaultHostExecutionSpace,
+                                               Kokkos::Rank<3>>;
+        
+        Kokkos::parallel_for("PackHydroSinglePass",
+            Policy3D({1, 1, 1}, {nz+1, ny+1, nx+1}),
+            [&](int k, int j, int i) {
+                size_t buf_idx = ((k-1) * ny * nx) + ((j-1) * nx) + (i-1);
+                char* cell_base = (char*)&h_base[voxel(i, j, k)];
+                
+                for (int v = 0; v < num_active; ++v) {
+                    buffer(v, buf_idx) = *(float*)(cell_base + active_vars[v].offset);
+                }
+            });
+        Kokkos::fence();
+                t_buf_pack = wallclock() - t_phase_start;
+        t_compute = 0.0;
+
+        t_phase_start = wallclock();
+
+        for (int v = 0; v < num_active; ++v) {
+            hid_t dset = H5Dcreate2(fid, active_vars[v].name, H5T_NATIVE_FLOAT,
+                                   dspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            
+            H5Dwrite(dset, H5T_NATIVE_FLOAT, mspace, dspace, dxpl, &buffer(v, 0));
+            H5Dclose(dset);
+        }
+
+        t_h5dwrite = wallclock() - t_phase_start;
+
+        t_phase_start = wallclock();
+        H5Sclose(mspace);
+        H5Sclose(dspace);
+        H5Fclose(fid);
+        t_meta_close = wallclock() - t_phase_start;
+        
+        double t_total = wallclock() - t_total_start;
+
+        double max_setup, max_meta_create, max_buf_pack, max_compute,
+               max_h5dwrite, max_meta_close, max_total;
+        
+        mp_allmax_d(&t_setup, &max_setup, 1);
+        mp_allmax_d(&t_meta_create, &max_meta_create, 1);
+        mp_allmax_d(&t_buf_pack, &max_buf_pack, 1);
+        mp_allmax_d(&t_compute, &max_compute, 1);
+        mp_allmax_d(&t_h5dwrite, &max_h5dwrite, 1);
+        mp_allmax_d(&t_meta_close, &max_meta_close, 1);
+        mp_allmax_d(&t_total, &max_total, 1);
+
+        if (rank() == 0 && num_active > 0) {
+            double mb_total = ((double)(num_cells * num_active * sizeof(float)) / 
+                              (1024.0 * 1024.0)) * nproc();
+            
+            double t_metric = TIME_PURE_IO_ONLY ? max_h5dwrite : max_total;
+            double throughput = mb_total / t_metric;
+            
+            char tag[128];
+            snprintf(tag, 128, "write_hydro_hdf5_M2M_%s_serial", sp_name);
+            
+            MESSAGE(("[METRIC],%s,%ld,%.4f,%.4f,%.4f",
+                     tag, (long)step(), t_metric, mb_total, throughput));
+            
+            MESSAGE(("[DIAGNOSTIC],%s,%ld,Total:%.4f,Setup:%.4f,MetaCreate:%.4f,"
+                     "BufPack:%.4f,Compute:%.4f,H5Dwrite:%.4f,MetaClose:%.4f",
+                     tag, (long)step(), max_total, max_setup, max_meta_create,
+                     max_buf_pack, max_compute, max_h5dwrite, max_meta_close));
+        }
+        
+        // XDMF generation
+        XDMFGridInfo xinfo;
+        xinfo.dims[0] = g->nz;
+        xinfo.dims[1] = g->ny;
+        xinfo.dims[2] = g->nx;
+        xinfo.origin[0] = g->x0;
+        xinfo.origin[1] = g->y0;
+        xinfo.origin[2] = g->z0;
+        xinfo.spacing[0] = g->dx;
+        xinfo.spacing[1] = g->dy;
+        xinfo.spacing[2] = g->dz;
+        
+        if (rank() == 0) {
+            std::vector<const char*> var_list;
+            for (const auto& v : active_vars) var_list.push_back(v.name);
+            
+            char xmf_path[512], h5_file[256];
+            snprintf(xmf_path, 512, "%s/T.%ld/%s.%ld.xmf",
+                    params.baseDir, (long)step(), params.baseFileName, (long)step());
+            snprintf(h5_file, 256, "%s.%ld.0.h5", params.baseFileName, (long)step());
+            
+            write_xdmf_structured(xmf_path, h5_file, var_list, xinfo, g);
+            MESSAGE((" Created ParaView file: %s (serial HDF5, per-rank files)", xmf_path));
+        }
+
+    } KOKKOS_TOC(write_hydro_hdf5, 1);
+}
+
+// =============================================================================
+// HDF5 NOT AVAILABLE - STUBS
+// =============================================================================
+
+#else  // !VPIC_ENABLE_HDF5
+
+// HDF5 disabled - provide error stubs
+
+void vpic_simulation::write_particles_hdf5(const char* fbase, 
+                                           const char* species_name, 
+                                           bool single_file,
+                                           bool compute_physical_position) {
+    if (rank() == 0) {
+        ERROR(("write_particles_hdf5() requires HDF5 support. "
+               "Rebuild with VPIC_ENABLE_HDF5=ON."));
+    }
+}
+
+void vpic_simulation::write_fields_hdf5(DumpParameters& params, 
+                                        field_array_t* fa, 
+                                        bool single_file) {
+    if (rank() == 0) {
+        ERROR(("write_fields_hdf5() requires HDF5 support. "
+               "Rebuild with VPIC_ENABLE_HDF5=ON."));
+    }
+}
+
+void vpic_simulation::write_hydro_hdf5(DumpParameters& params, 
+                                       hydro_array_t* ha, 
+                                       const char* sp_name, 
+                                       bool single_file) {
+    if (rank() == 0) {
+        ERROR(("write_hydro_hdf5() requires HDF5 support. "
+               "Rebuild with VPIC_ENABLE_HDF5=ON."));
+    }
+}
+
+void vpic_simulation::write_xdmf_timeseries(const char* series_path,
+                                            const std::vector<int>& steps,
+                                            const char* base_pattern,
+                                            const char* base_filename) {
+    if (rank() == 0) {
+        ERROR(("write_xdmf_timeseries() requires HDF5 support. "
+               "Rebuild with VPIC_ENABLE_HDF5=ON."));
+    }
+}
+
+#endif  // VPIC_ENABLE_HDF5

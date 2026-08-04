@@ -73,6 +73,7 @@ option(VPIC_ENABLE_VECTORIZATION "Enable improved vectorization for CPUs" OFF)
 option(VPIC_ENABLE_ACCUMULATOR "Enable explicit accumulators for better performnace on CPUs" OFF)
 
 option(VPIC_ENABLE_HDF5 "Enable HDF5 output support" OFF)
+option(VPIC_HDF5_SERIAL_ONLY "Enforce that HDF5 be loaded as serial" OFF)
 option(VPIC_ENABLE_HDF5_ASYNC "Enable HDF5 Async support (Experimental)" OFF)
 
 add_definitions(-DUSE_KOKKOS)
@@ -166,8 +167,8 @@ else()
 endif()
 
 if(ENABLE_KOKKOS_CUDA)
-  find_package(CUDA)
-  if (CUDA_FOUND)
+  find_package(CUDAToolkit)
+  if (CUDAToolkit_FOUND)
     add_definitions(-DENABLE_KOKKOS_CUDA)
 
     # --- Ensure the CUDA driver library (libcuda) is linked into deck builds ---
@@ -295,7 +296,14 @@ find_package(Threads REQUIRED)
 
 if(VPIC_ENABLE_HDF5)
   enable_language(C)
-  set(HDF5_PREFER_PARALLEL ON)
+  # Check if user wants to force serial HDF5
+  if(VPIC_HDF5_SERIAL_ONLY)
+    message(STATUS "VPIC: Forcing serial HDF5 (VPIC_HDF5_SERIAL_ONLY=ON)")
+    set(HDF5_PREFER_PARALLEL OFF)
+    add_definitions(-DVPIC_HDF5_SERIAL_ONLY)
+  else()
+    set(HDF5_PREFER_PARALLEL ON)
+  endif()
   
   # Find HDF5 package
   find_package(HDF5 COMPONENTS C HL REQUIRED)
@@ -308,18 +316,26 @@ if(VPIC_ENABLE_HDF5)
   # -----------------------------------------------------------------------------
   set(HDF5_VPIC_LIBS "")  # This will hold actual library objects for target_link_libraries
 
-  find_program(H5PCC_EXECUTABLE h5pcc)
-  if(H5PCC_EXECUTABLE)
+  # Determine which wrapper to use based on serial-only flag
+  if(VPIC_HDF5_SERIAL_ONLY)
+    find_program(H5_WRAPPER_EXECUTABLE h5cc)
+    set(WRAPPER_NAME "h5cc")
+  else()
+    find_program(H5_WRAPPER_EXECUTABLE h5pcc)
+    set(WRAPPER_NAME "h5pcc")
+  endif()
+
+  if(H5_WRAPPER_EXECUTABLE)
       execute_process(
-          COMMAND ${H5PCC_EXECUTABLE} -show
-          OUTPUT_VARIABLE H5PCC_SHOW_OUTPUT
+          COMMAND ${H5_WRAPPER_EXECUTABLE} -show
+          OUTPUT_VARIABLE H5_SHOW_OUTPUT
           OUTPUT_STRIP_TRAILING_WHITESPACE
       )
       
-      message(STATUS "VPIC: h5pcc output: ${H5PCC_SHOW_OUTPUT}")
+      message(STATUS "VPIC: ${WRAPPER_NAME} output: ${H5_SHOW_OUTPUT}")
       
       # Extract -L directory using regex (captures the path after -L)
-      string(REGEX MATCH "-L([^ ]+)" HDF5_L_MATCH "${H5PCC_SHOW_OUTPUT}")
+      string(REGEX MATCH "-L([^ ]+)" HDF5_L_MATCH "${H5_SHOW_OUTPUT}")
       
       if(CMAKE_MATCH_1)
           set(HDF5_LIB_PATH "${CMAKE_MATCH_1}")
@@ -387,7 +403,9 @@ if(VPIC_ENABLE_HDF5)
   endif()
 
   # Status Reporting
-  if(HDF5_IS_PARALLEL)
+  if(VPIC_HDF5_SERIAL_ONLY)
+    message(STATUS "VPIC: HDF5 Serial Forced by User (VPIC_HDF5_SERIAL_ONLY)")
+  elseif(HDF5_IS_PARALLEL)
     message(STATUS "VPIC: HDF5 Parallel Enabled")
     add_definitions(-DVPIC_HDF5_PARALLEL)
   else()
