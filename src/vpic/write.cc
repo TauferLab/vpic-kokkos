@@ -83,19 +83,38 @@ void vpic_simulation::write_fields_binary(DumpParameters& params, field_array_t*
         grid_t* g = fa->g;
 
         // Define field component mapping: bitmask index -> memory offset
+        enum VarType { VT_FLOAT, VT_MATID };
         struct FieldComponent {
             int bit;    ///< Bit index in output_vars bitmask
             int offset; ///< Byte offset within field_t structure
+            VarType type;
         };
 
         static const std::vector<FieldComponent> field_map = {
-            {0, (int)offsetof(field_t, ex)},   // Electric field components
-            {1, (int)offsetof(field_t, ey)},
-            {2, (int)offsetof(field_t, ez)},
-            {4, (int)offsetof(field_t, cbx)},  // Magnetic field components (centered)
-            {5, (int)offsetof(field_t, cby)},
-            {6, (int)offsetof(field_t, cbz)}
-            // Note: div_e_err (bit 3) and div_b_err (bit 7) can be added if needed
+            {0, (int)offsetof(field_t, ex), VT_FLOAT},   // Electric field components
+            {1, (int)offsetof(field_t, ey), VT_FLOAT},
+            {2, (int)offsetof(field_t, ez), VT_FLOAT},
+            {3, (int)offsetof(field_t, div_e_err), VT_FLOAT},
+            {4, (int)offsetof(field_t, cbx), VT_FLOAT},  // Magnetic field components (centered)
+            {5, (int)offsetof(field_t, cby), VT_FLOAT},
+            {6, (int)offsetof(field_t, cbz), VT_FLOAT},
+            {7, (int)offsetof(field_t, div_b_err), VT_FLOAT},
+            {8, (int)offsetof(field_t, tcax), VT_FLOAT},
+            {9, (int)offsetof(field_t, tcay), VT_FLOAT},
+            {10,(int)offsetof(field_t, tcaz), VT_FLOAT},
+            {11,(int)offsetof(field_t, rhob), VT_FLOAT},
+            {12,(int)offsetof(field_t, jfx), VT_FLOAT},
+            {13,(int)offsetof(field_t, jfy), VT_FLOAT},
+            {14,(int)offsetof(field_t, jfz), VT_FLOAT},
+            {15,(int)offsetof(field_t, rhof), VT_FLOAT},
+            {16,(int)offsetof(field_t, ematx), VT_MATID},
+            {17,(int)offsetof(field_t, ematy), VT_MATID},
+            {18,(int)offsetof(field_t, ematz), VT_MATID},
+            {19,(int)offsetof(field_t, nmat),  VT_MATID},
+            {20,(int)offsetof(field_t, fmatx), VT_MATID},
+            {21,(int)offsetof(field_t, fmaty), VT_MATID},
+            {22,(int)offsetof(field_t, fmatz), VT_MATID},
+            {23,(int)offsetof(field_t, cmat),  VT_MATID}
         };
 
         // Create output directory structure
@@ -149,7 +168,10 @@ void vpic_simulation::write_fields_binary(DumpParameters& params, field_array_t*
                     for (int j = 1; j <= g->ny; j++) {
                         for (int i = 1; i <= g->nx; i++) {
                             int voxel_idx = voxel(i, j, k);
-                            float val = *(float*)((char*)&f_base[voxel_idx] + comp.offset);
+                            const char* p = (char*)&f_base[voxel_idx] + comp.offset;
+                            float val = (comp.type == VT_MATID)
+                              ? (float)(*(const material_id*)p)
+                              : *(const float*)p;
                             buffer[idx++] = val;
                         }
                     }
@@ -1386,34 +1408,47 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
         // ---------------------------------------------------------------------
         // Maps user-selected bit indices to field_t memory layout.
         // Only variables with bitset(bit) == true will be written.
-        
-        struct FieldMap { 
-            int bit;            // Bit index in params.output_vars
-            const char* name;   // HDF5 dataset name
-            int offset;         // Byte offset within field_t struct
-        };
-        
+
+        enum VarType { VT_FLOAT, VT_MATID };
+        struct FieldMap { int bit; const char* name; int offset; VarType type; };
         static const std::vector<FieldMap> field_map = {
-            {0, "ex",         offsetof(field_t, ex)},
-            {1, "ey",         offsetof(field_t, ey)},
-            {2, "ez",         offsetof(field_t, ez)},
-            {3, "div_e_err",  offsetof(field_t, div_e_err)},
-            {4, "cbx",        offsetof(field_t, cbx)},
-            {5, "cby",        offsetof(field_t, cby)},
-            {6, "cbz",        offsetof(field_t, cbz)},
-            {7, "div_b_err",  offsetof(field_t, div_b_err)}
+            {0, "ex",         offsetof(field_t, ex), VT_FLOAT},
+            {1, "ey",         offsetof(field_t, ey), VT_FLOAT},
+            {2, "ez",         offsetof(field_t, ez), VT_FLOAT},
+            {3, "div_e_err",  offsetof(field_t, div_e_err), VT_FLOAT},
+            {4, "cbx",        offsetof(field_t, cbx), VT_FLOAT},
+            {5, "cby",        offsetof(field_t, cby), VT_FLOAT},
+            {6, "cbz",        offsetof(field_t, cbz), VT_FLOAT},
+            {7, "div_b_err",  offsetof(field_t, div_b_err), VT_FLOAT},
+            {8,  "tcax",      offsetof(field_t, tcax), VT_FLOAT},
+            {9,  "tcay",      offsetof(field_t, tcay), VT_FLOAT},
+            {10, "tcaz",      offsetof(field_t, tcaz), VT_FLOAT},
+            {11, "rhob",      offsetof(field_t, rhob), VT_FLOAT},
+            {12, "jfx",       offsetof(field_t, jfx), VT_FLOAT},
+            {13, "jfy",       offsetof(field_t, jfy), VT_FLOAT},
+            {14, "jfz",       offsetof(field_t, jfz), VT_FLOAT},
+            {15, "rhof",      offsetof(field_t, rhof), VT_FLOAT},
+            {16, "ematx",     offsetof(field_t, ematx), VT_MATID},
+            {17, "ematy",     offsetof(field_t, ematy), VT_MATID},
+            {18, "ematz",     offsetof(field_t, ematz), VT_MATID},
+            {19, "nmat",      offsetof(field_t, nmat),  VT_MATID},
+            {20, "fmatx",     offsetof(field_t, fmatx), VT_MATID},
+            {21, "fmaty",     offsetof(field_t, fmaty), VT_MATID},
+            {22, "fmatz",     offsetof(field_t, fmatz), VT_MATID},
+            {23, "cmat",      offsetof(field_t, cmat),  VT_MATID}
         };
         
         // Filter to only actively requested variables
         struct ActiveVar { 
             const char* name; 
             int offset; 
+            VarType type;
         };
         std::vector<ActiveVar> active_vars;
         
         for (const auto& m : field_map) {
             if (params.output_vars.bitset(m.bit)) {
-                active_vars.push_back({m.name, m.offset});
+                active_vars.push_back({m.name, m.offset, m.type});
             }
         }
         int num_active = active_vars.size();
@@ -1468,7 +1503,7 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
         
         // Persistent buffer to avoid repeated allocations
         // Dimensions: [max_vars=8][num_cells]
-        static Kokkos::View<float**, Kokkos::HostSpace> buffer("h5_field_buf", 8, 0);
+        static Kokkos::View<float**, Kokkos::HostSpace> buffer("h5_field_buf", 16, 0);
         if (buffer.extent(1) < num_cells) {
             Kokkos::resize(buffer, 8, num_cells);
         }
@@ -1498,7 +1533,10 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
                 
                 // Extract all active components via offset pointer arithmetic
                 for (int v = 0; v < num_active; ++v) {
-                    buffer(v, buf_idx) = *(float*)(cell_base + active_vars[v].offset);
+                    const char* p = cell_base + active_vars[v].offset;
+                    buffer(v, buf_idx) = (active_vars[v].type == VT_MATID)
+                       ? (float)(*(material_id*)p)   // widen int -> float
+                       : *(float*)p;
                 }
             });
         Kokkos::fence();
@@ -2491,26 +2529,45 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
             int offset;
         };
         
+        enum VarType { VT_FLOAT, VT_MATID };
+        struct FieldMap { int bit; const char* name; int offset; VarType type; };
         static const std::vector<FieldMap> field_map = {
-            {0, "ex",         offsetof(field_t, ex)},
-            {1, "ey",         offsetof(field_t, ey)},
-            {2, "ez",         offsetof(field_t, ez)},
-            {3, "div_e_err",  offsetof(field_t, div_e_err)},
-            {4, "cbx",        offsetof(field_t, cbx)},
-            {5, "cby",        offsetof(field_t, cby)},
-            {6, "cbz",        offsetof(field_t, cbz)},
-            {7, "div_b_err",  offsetof(field_t, div_b_err)}
+            {0, "ex",         offsetof(field_t, ex), VT_FLOAT},
+            {1, "ey",         offsetof(field_t, ey), VT_FLOAT},
+            {2, "ez",         offsetof(field_t, ez), VT_FLOAT},
+            {3, "div_e_err",  offsetof(field_t, div_e_err), VT_FLOAT},
+            {4, "cbx",        offsetof(field_t, cbx), VT_FLOAT},
+            {5, "cby",        offsetof(field_t, cby), VT_FLOAT},
+            {6, "cbz",        offsetof(field_t, cbz), VT_FLOAT},
+            {7, "div_b_err",  offsetof(field_t, div_b_err), VT_FLOAT},
+            {8,  "tcax",      offsetof(field_t, tcax), VT_FLOAT},
+            {9,  "tcay",      offsetof(field_t, tcay), VT_FLOAT},
+            {10, "tcaz",      offsetof(field_t, tcaz), VT_FLOAT},
+            {11, "rhob",      offsetof(field_t, rhob), VT_FLOAT},
+            {12, "jfx",       offsetof(field_t, jfx), VT_FLOAT},
+            {13, "jfy",       offsetof(field_t, jfy), VT_FLOAT},
+            {14, "jfz",       offsetof(field_t, jfz), VT_FLOAT},
+            {15, "rhof",      offsetof(field_t, rhof), VT_FLOAT},
+            {16, "ematx",     offsetof(field_t, ematx), VT_MATID},
+            {17, "ematy",     offsetof(field_t, ematy), VT_MATID},
+            {18, "ematz",     offsetof(field_t, ematz), VT_MATID},
+            {19, "nmat",      offsetof(field_t, nmat),  VT_MATID},
+            {20, "fmatx",     offsetof(field_t, fmatx), VT_MATID},
+            {21, "fmaty",     offsetof(field_t, fmaty), VT_MATID},
+            {22, "fmatz",     offsetof(field_t, fmatz), VT_MATID},
+            {23, "cmat",      offsetof(field_t, cmat),  VT_MATID}
         };
         
         struct ActiveVar { 
             const char* name; 
             int offset; 
+            VarType type;
         };
         std::vector<ActiveVar> active_vars;
         
         for (const auto& m : field_map) {
             if (params.output_vars.bitset(m.bit)) {
-                active_vars.push_back({m.name, m.offset});
+                active_vars.push_back({m.name, m.offset, m.type});
             }
         }
         int num_active = active_vars.size();
@@ -2541,7 +2598,7 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
 
         size_t num_cells = g->nx * g->ny * g->nz;
         
-        static Kokkos::View<float**, Kokkos::HostSpace> buffer("h5_field_buf", 8, 0);
+        static Kokkos::View<float**, Kokkos::HostSpace> buffer("h5_field_buf", 16, 0);
         if (buffer.extent(1) < num_cells) {
             Kokkos::resize(buffer, 8, num_cells);
         }
@@ -2561,7 +2618,10 @@ void vpic_simulation::write_fields_hdf5(DumpParameters& params,
                 char* cell_base = (char*)&f_base[voxel(i, j, k)];
                 
                 for (int v = 0; v < num_active; ++v) {
-                    buffer(v, buf_idx) = *(float*)(cell_base + active_vars[v].offset);
+                    const char* p = cell_base + active_vars[v].offset;
+                    buffer(v, buf_idx) = (active_vars[v].type == VT_MATID)
+                       ? (float)(*(material_id*)p)   // widen int -> float
+                       : *(float*)p;
                 }
             });
         Kokkos::fence();
