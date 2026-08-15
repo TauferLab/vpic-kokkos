@@ -10,7 +10,7 @@
 
 #include <ctime>
 
-#define RUN3D 0
+#define RUN3D 1
 
 // This is probably unnecessary on modern parallel file systems, e.g., lustre,
 // so set to something high to effectively disable it.
@@ -57,6 +57,7 @@ begin_globals {
   double omega_0;                // w0/wpe
   int energies_interval;        // how frequently to dump energies
   int    field_interval;         // how frequently to dump field built-in
+  int    hydro_interval;
                                  // diagnostic
   int    restart_interval; 	 // how frequently to write restart file. 
   int    quota_check_interval;   // how often to check if quote exceeded
@@ -219,20 +220,20 @@ begin_initialization {
   // Simulation parameters
   // These are floating point to avoid a lot of casting
   // Increase resolution to ~3000 for physical results
-  double nx = 500;
+  double nx = 448.0;
 #if RUN3D
-  double ny = 500;
+  double ny = 256.0;
 #else
   double ny = 1;
 #endif
-  double nz = 500;
+  double nz = 256.0;
 
   double nppc = 60;  // Average number of macro particles/cell of each species
 
-  int topology_x = 2;
-  int topology_y = 1;
-  int topology_z = 2;
-  double quota = 1;             // Run quota in hours.  
+  int topology_x = 7;
+  int topology_y = 4;
+  int topology_z = 4;
+  double quota = 6;             // Run quota in hours.  
   double quota_sec = quota*3600;  // Run quota in seconds. 
 
   // Reduce the size of the grid data when writing to disk?
@@ -327,12 +328,13 @@ begin_initialization {
 
 
   // Diagnostics intervals.  
-  int energies_interval = 50;
-  int field_interval    = 400;//int(5./omega_L_SI / time_to_SI / dt);
-  int particle_interval = 10*field_interval; // Check if disabled in user_diag
+  int energies_interval = 0;
+  int field_interval    = 0;//int(5./omega_L_SI / time_to_SI / dt);
+  int hydro_interval    = 0;
+  int particle_interval = int(0.75 * t_stop / dt); // Check if disabled in user_diag
 
-  int restart_interval = 400;
-  int quota_check_interval = 200;
+  int restart_interval = 0;
+  int quota_check_interval = 2;
 
   int spectra_interval = int(pulse_FWHM/dt);
 
@@ -454,8 +456,8 @@ begin_initialization {
   // FIXME : proper normalization in these units for: xfocus, ycenter, zcenter,
   // waist
   sim_log("Setting up high-level simulation parameters. "); 
-  num_step             = int(t_stop/(dt)); 
-  status_interval      = 100; 
+  num_step = int(t_stop/(dt));
+  status_interval      = 500; 
 //?????????????????????????????????????????????????????????????????????????????
   sync_shared_interval = status_interval/5;
   clean_div_e_interval = status_interval/5;
@@ -469,6 +471,7 @@ begin_initialization {
 
   global->energies_interval        = energies_interval;
   global->field_interval           = field_interval; 
+  global->hydro_interval		   = hydro_interval;
   global->restart_interval         = restart_interval;
   global->quota_check_interval = quota_check_interval;
   global->emax                     = emax; 
@@ -526,7 +529,7 @@ begin_initialization {
 //???????????????????????????????????????????????????????????????????????
   // How oversized should the particle buffers be in case of non-uniform plasma?
   // This will not resize automatically; your run will crash if overflowed
-  double over_alloc_fac = 3;
+  double over_alloc_fac = 1.5;
   double max_local_np_e            = over_alloc_fac*particles_alloc/nproc();
   double max_local_np_i1            = max_local_np_e;
   // The movers are NOT resized and must be set big enough here.
@@ -535,31 +538,14 @@ begin_initialization {
 
   species_t * electron = define_species("electron", -1.*e_c, m_e_c,
           max_local_np_e, max_local_nm_e, 20, 0);
-  electron->pb_diag->write_ux = 1;
-  electron->pb_diag->write_uy = 1;
-  electron->pb_diag->write_uz = 1;
-  electron->pb_diag->write_weight = 1;
-  electron->pb_diag->write_posx = 1;
-  electron->pb_diag->write_posy = 1;
-  electron->pb_diag->write_posz = 1;
-  finalize_pb_diagnostic(electron);
   species_t *ion_I1;
   if ( mobile_ions ) {
   sim_log("Setting up ions. ");
     if ( I1_present  ) {
         ion_I1 = define_species("I1", Z_I1*e_c, m_I1_c,
             max_local_np_i1, max_local_nm_i1, 80, 0);
-        ion_I1->pb_diag->write_ux = 1;
-        ion_I1->pb_diag->write_uy = 1;
-        ion_I1->pb_diag->write_uz = 1;
-        ion_I1->pb_diag->write_weight = 1;
-        ion_I1->pb_diag->write_posx = 1;
-        ion_I1->pb_diag->write_posy = 1;
-        ion_I1->pb_diag->write_posz = 1;
-        finalize_pb_diagnostic(ion_I1);
     }
   }
-
 
   // SETUP THE MATERIALS
   // Note: the semantics of Kevin's boundary handler for systems where the
@@ -883,7 +869,14 @@ begin_initialization {
 begin_diagnostics {
 
   //if ( step()%1==0 ) sim_log("Time step: "<<step()); 
-
+  // =======================================================================
+  // BENCHMARK I/O MODE SELECTOR
+  // 0 = Legacy VPIC Dump
+  // 1 = Optimized Binary
+  // 2 = Optimized HDF5 File-per-Process (M2M)
+  // 3 = Optimized HDF5 Collective-I/O (M2O)
+  // =======================================================================
+  const int IO_MODE = 3;
 # define should_dump(x) \
   (global->x##_interval>0 && remainder(step(),global->x##_interval)==0)
 
@@ -927,26 +920,84 @@ begin_diagnostics {
             dump_energies( "rundata/energies", step() ==0 ? 0 : 1 );
   } //if
 
-  if ( should_dump(field) ) {
-    //field_array->copy_to_host();// field_dump() will do this if necessary.
-    field_dump( global->fdParams );
+  if (should_dump(field) ) {
+    char orig_fname[256];
+    strcpy(orig_fname, global->fdParams.baseFileName);
 
-    if ( global->load_particles ) {
-      hydro_dump( "electron", global->hedParams );
-      if ( global->mobile_ions ) {
-        if ( global->I1_present ) hydro_dump( "I1", global->hI1dParams );
-      }
-  
-
-      // This is also a good time to write the pb_diag buffers to disk
-      species_t * sp;
-      LIST_FOR_EACH(sp, species_list){
-          if(sp->pb_diag) pbd_buff_to_disk(sp->pb_diag);
-      }
+    if ( IO_MODE == 0 ) {
+      sprintf(global->fdParams.baseFileName, "fields_dump");
+      field_dump( global->fdParams );
+    } 
+    else if ( IO_MODE == 1 ) {
+      sprintf(global->fdParams.baseFileName, "fields_bin");
+      write_fields_binary( global->fdParams, field_array );
+    } 
+    else if ( IO_MODE == 2 ) {
+      sprintf(global->fdParams.baseFileName, "fields_m2m_h5");
+      write_fields_hdf5( global->fdParams, field_array, false );
     }
-
+	else if ( IO_MODE == 3 ) {
+      sprintf(global->fdParams.baseFileName, "fields_m2o_h5");
+      write_fields_hdf5( global->fdParams, field_array, true );
+    }
+    
+    strcpy(global->fdParams.baseFileName, orig_fname);
   }
 
+  if (should_dump(hydro) && global->load_particles ) {
+    char orig_hname[256];
+    strcpy(orig_hname, global->hedParams.baseFileName);
+
+    // --- Electron Hydro ---
+    if ( IO_MODE == 0 ) {
+      sprintf(global->hedParams.baseFileName, "ehydro_dump");
+      hydro_dump( "electron", global->hedParams );
+    } 
+    else if ( IO_MODE == 1 ) {
+      sprintf(global->hedParams.baseFileName, "ehydro_bin");
+      write_hydro_binary( global->hedParams, hydro_array, "electron" );
+    } 
+    else if ( IO_MODE == 2 ) {
+      sprintf(global->hedParams.baseFileName, "ehydro_m2m_h5");
+      write_hydro_hdf5( global->hedParams, hydro_array, "electron", false );
+    }
+	else if ( IO_MODE == 3 ) {
+      sprintf(global->hedParams.baseFileName, "ehydro_m2o_h5");
+      write_hydro_hdf5( global->hedParams, hydro_array, "electron", true );
+    }
+    strcpy(global->hedParams.baseFileName, orig_hname);
+
+    // --- Ion Hydro (I1) ---
+    if ( global->mobile_ions && global->I1_present ) {
+      char orig_I1name[256];
+      strcpy(orig_I1name, global->hI1dParams.baseFileName);
+      
+      if ( IO_MODE == 0 ) {
+        sprintf(global->hI1dParams.baseFileName, "I1hydro_dump");
+        hydro_dump( "I1", global->hI1dParams );
+      } 
+      else if ( IO_MODE == 1 ) {
+        sprintf(global->hI1dParams.baseFileName, "I1hydro_bin");
+        write_hydro_binary( global->hI1dParams, hydro_array, "I1" );
+      } 
+      else if ( IO_MODE == 2 ) {
+        sprintf(global->hI1dParams.baseFileName, "I1hydro_m2m_h5");
+        write_hydro_hdf5( global->hI1dParams, hydro_array, "I1", false );
+      }
+	  else if ( IO_MODE == 3 ) {
+        sprintf(global->hI1dParams.baseFileName, "I1hydro_m2o_h5");
+        write_hydro_hdf5( global->hI1dParams, hydro_array, "I1", true );
+      }
+      strcpy(global->hI1dParams.baseFileName, orig_I1name);
+    }
+  
+    // PB Diagnostic Buffer writing
+    species_t * sp;
+    LIST_FOR_EACH(sp, species_list){
+        if(sp->pb_diag) pbd_buff_to_disk(sp->pb_diag);
+    }
+  }
+/*
   if(step()==num_step){
   // Dump all remaining particles into the pb_diagnostic for convienience
     // This spits out a bunch of warnings
@@ -963,22 +1014,35 @@ begin_diagnostics {
       }
     }
   }
-
+*/
   // Particle dump data
-#if 0
-  if ( should_dump(particle) && global->load_particles ) {
-    // dump_particles will do this if necessary
-    /*species_t * sp;
-      LIST_FOR_EACH(sp, species_list){
-          sp->copy_to_host();
-      }*/
-
-    dump_particles( "electron", "particle/eparticle" );
-    if ( global->mobile_ions ) {
-      if (global->I1_present) dump_particles( "I1", "particle/I1particle" );
+  if (should_dump(particle) && global->load_particles) {
+    
+    if ( IO_MODE == 0 ) {
+      dump_particles( "electron", "particle/eparticle_dump" );
+      if ( global->mobile_ions && global->I1_present ) {
+        dump_particles( "I1", "particle/I1particle_dump" );
+      }
+    } 
+    else if ( IO_MODE == 1 ) {
+      write_particles_binary( "particle/eparticle_bin", "electron" );
+      if ( global->mobile_ions && global->I1_present ) {
+        write_particles_binary( "particle/I1particle_bin", "I1" );
+      }
+    } 
+    else if ( IO_MODE == 2 ) {
+      write_particles_hdf5( "particle/eparticle_m2m_h5", "electron", false );
+      if ( global->mobile_ions && global->I1_present ) {
+        write_particles_hdf5( "particle/I1particle_m2m_h5", "I1", false );
+      }
+    }
+	else if ( IO_MODE == 3 ) {
+      write_particles_hdf5( "particle/eparticle_m2o_h5", "electron", true );
+      if ( global->mobile_ions && global->I1_present ) {
+        write_particles_hdf5( "particle/I1particle_m2o_h5", "I1", true );
+      }
     }
   }
-#endif
 
 
 
